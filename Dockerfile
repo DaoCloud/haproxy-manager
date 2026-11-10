@@ -24,8 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # iproute2 lets the app report which addresses this node holds, and
 # iputils-arping lets it notice when another machine is using one of them.
 #
-# One layer, so a scheduled rebuild without the cache refreshes everything at
-# once -- the Debian security updates along with HAProxy's point releases.
+# A no-cache rebuild refreshes Debian security updates and HAProxy together.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \

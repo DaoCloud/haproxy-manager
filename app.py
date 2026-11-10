@@ -41,7 +41,6 @@ from ham.base import (CONF_PATH, DATA_DIR, LISTEN, PORT, THREADS, VERSION,
 from ham.config import load_config, save_config
 from ham.auth import bad_username, key_fingerprint, set_admin
 from ham.acme import _renew_loop
-from ham.updates import _update_loop
 from ham.watchdog import _watchdog_loop
 from ham import crowdsec, startup, sync, traffic
 
@@ -196,7 +195,6 @@ if __name__ == "__main__":
     if not CONF_PATH.exists():
         save_config(load_config())
     threading.Thread(target=_renew_loop, daemon=True).start()
-    threading.Thread(target=_update_loop, daemon=True).start()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     # In its own thread, so a peer that is slow to answer cannot delay the
     # listener coming up: a node that is catching up should still be reachable

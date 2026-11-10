@@ -3,7 +3,7 @@ name: Check upstream versions
 # The container image pins two things that move on their own schedule: the
 # HAProxy branch it installs from haproxy.debian.net (ARG HAPROXY_BRANCH) and
 # the acme.sh release it and install.sh carry (ARG ACME_VERSION). Debian's own
-# packages need no watching -- the weekly image rebuild picks them up -- but
+# packages are refreshed whenever the image is rebuilt, but
 # a new HAProxy LTS or an acme.sh release would otherwise go unnoticed.
 #
 # Once a week this compares the pins with what is out there and, when either
@@ -13,7 +13,7 @@ name: Check upstream versions
 
 on:
   schedule:
-    - cron: '41 5 * * 1'      # Mondays, after the weekly image rebuild
+    - cron: '41 5 * * 1'      # Mondays, 05:41 UTC
   workflow_dispatch:
 
 jobs:
