@@ -40,10 +40,12 @@ def api_peers():
     if request.method == "GET":
         # Never hand the stored keys back to the browser.
         own = auth.key_fingerprint(cfg["local"].get("api_key"))
+        me = (cfg["local"].get("node_url") or "").rstrip("/").lower()
         return jsonify([{k: v for k, v in p.items() if k != "api_key"} |
                         {"has_key": bool((p.get("api_key") or "").strip()),
                          "key_fp": auth.key_fingerprint(p.get("api_key")),
-                         "is_own_key": bool(own) and auth.key_fingerprint(p.get("api_key")) == own}
+                         "is_own_key": bool(own) and auth.key_fingerprint(p.get("api_key")) == own,
+                         "is_self": bool(me) and (p.get("url") or "").rstrip("/").lower() == me}
                         for p in peers])
     body = request.get_json(force=True) or {}
     url = (body.get("url") or "").strip().rstrip("/")
@@ -108,12 +110,10 @@ def api_peer_test(pid):
         return jsonify({"ok": False, "error":
                         "no API key is stored here for %s. Copy the key from Cluster > This node "
                         "on that node and paste it into this peer's entry." % peer.get("name")})
-    if auth.key_matches(cfg["local"].get("api_key"), stored):
+    me = (cfg["local"].get("node_url") or "").rstrip("/").lower()
+    if me and url.rstrip("/").lower() == me:
         return jsonify({"ok": False, "error":
-                        "this entry holds THIS node's own API key (fingerprint %s), not %s's. With "
-                        "a window open on each node it is easy to copy from the wrong one -- the "
-                        "page header names the node it belongs to."
-                        % (auth.key_fingerprint(stored), peer.get("name"))})
+                        "This entry points to this node. Use the other node's management URL."})
     try:
         r = _requests.get(url + "/api/status", headers={"X-API-Key": stored.strip()},
                           timeout=PEER_TIMEOUT, verify=bool(peer.get("verify_tls")))
@@ -129,7 +129,7 @@ def api_peer_test(pid):
             pass
         return jsonify({"ok": False, "error":
                         "%s rejected this key. This entry must hold the key shown under "
-                        "Cluster > This node ON THAT NODE -- not this node's own key." % url})
+                        "Cluster > This node on that node." % url})
 
     if r.status_code != 200:
         return jsonify({"ok": False, "error": "%s answered HTTP %s" % (url, r.status_code)})

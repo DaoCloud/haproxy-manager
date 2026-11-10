@@ -102,7 +102,8 @@ def render_keepalived(cfg):
         A("    interval 2")
         A("    fall 2")
         A("    rise 2")
-        A("    weight -30")
+        # An unweighted failure enters FAULT, even when nopreempt is set.
+        A("    weight 0")
         A("}")
         A("")
     A("vrrp_instance HAPROXY_VIP {")

@@ -105,6 +105,7 @@ ENV HAM_DATA_DIR=/var/lib/haproxy-manager \
     HAM_KEEPALIVED_CFG=/etc/keepalived/keepalived.conf \
     HAM_ACME_HOME=/var/lib/acme.sh \
     HAM_ACME_SH=/var/lib/acme.sh/acme.sh \
+    HAM_APPLY_ON_START=1 \
     HAM_LISTEN=0.0.0.0 \
     HAM_PORT=8080
 

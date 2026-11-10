@@ -67,18 +67,29 @@ def _find(items, pred):
     return None
 
 
-def _bind_ports(fe):
-    ports = set()
+def _bind_addresses(fe):
+    addresses = set()
     for line in (fe.get("binds") or "").splitlines():
         line = line.strip()
         if not line:
             continue
-        hostport = line.split()[0]
-        if ":" in hostport:
-            tail = hostport.rsplit(":", 1)[1]
-            if tail.isdigit():
-                ports.add(int(tail))
-    return ports
+        for hostport in line.split()[0].split(","):
+            host, sep, port = hostport.rpartition(":")
+            if sep and port.isdigit():
+                addresses.add((host.strip("[]").lower(), int(port)))
+    return addresses
+
+
+def _bind_ports(fe):
+    return {port for _, port in _bind_addresses(fe)}
+
+
+def _bind_conflicts(fe, host, port):
+    host = host.strip("[]").lower()
+    wildcards = ("", "*", "0.0.0.0", "::")
+    return any(bound_port == port and
+               (address == host or address in wildcards or host in wildcards)
+               for address, bound_port in _bind_addresses(fe))
 
 
 WIZARD_MARK = "created by the publish wizard"

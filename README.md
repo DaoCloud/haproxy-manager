@@ -17,10 +17,13 @@ HAProxy，并使用 Keepalived 实现共享虚拟 IP（VIP）和节点故障切�
 ## 双节点生产部署
 
 在两台独立的 Linux 主机上各运行一个包含 manager、HAProxy 和 Keepalived 的容器，
-使用宿主机网络，共用实际业务网络中的 VIP。
+使用宿主机网络，共用实际业务网络中的多个 VIP。
+用户接入 VPN 后通过不同 `VIP:端口` 访问各自的 backend，HTTPS 使用 TCP passthrough，
+不需要域名或 URL path 分流。
 
-按[双节点生产部署：Docker 与 API 初始化](docs/deploy-two-nodes-docker.md)完成
-镜像准备、容器启动、VIP 初始化、API 规则下发、应用确认和业务访问验证。
+按[双节点生产部署：多 VIP 四层转发](docs/deploy-two-nodes-docker.md)运行部署脚本，
+生成 `config.json` 并启动容器。共享 VIP 和规则只需在一台节点预置，
+另一台配置本机身份和 peer，首次同步后也会保存完整配置，无需手动调用初始化 API。
 直接使用本仓库发布的 `ghcr.io/daocloud/haproxy-manager:latest` 镜像，
 两节点应使用相同的仓库 digest。
 

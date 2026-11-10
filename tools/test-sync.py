@@ -86,6 +86,46 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(pulled["config"], sent["config"])
         self.assertEqual(shared_view(load_config()), shared_view(cfg))
 
+    def test_mesh_uses_node_urls_not_a_shared_key_to_identify_itself(self):
+        payload = self.payload(self.publish())
+        payload["peers"] = [
+            {"id": "self", "url": "HTTP://NODE-A/", "api_key": "another-key"},
+            {"id": "peer", "url": "http://node-b", "api_key": "receiver-key", "self": True},
+        ]
+        response = self.client.post("/api/sync/receive", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        peers = load_config()["local"]["sync"]["peers"]
+        self.assertEqual([peer["url"] for peer in peers], ["http://node-b"])
+        self.assertEqual(peers[0]["api_key"], "receiver-key")
+
+    def test_peer_connection_test_accepts_a_shared_cluster_key(self):
+        cfg = load_config()
+        cfg["local"]["sync"]["peers"] = [dict(self.peer, api_key="receiver-key")]
+        save_config(cfg)
+        requests = Mock()
+        requests.get.return_value = self.response(
+            {"hostname": "node-b", "version": "test", "role": "passive", "peers": []})
+        with patch.object(peering, "_requests", requests):
+            response = self.client.post("/api/peers/p/test")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"], response.get_json())
+        self.assertEqual(requests.get.call_args.kwargs["headers"]["X-API-Key"], "receiver-key")
+
+    def test_peer_connection_test_still_rejects_its_own_node_url(self):
+        cfg = load_config()
+        cfg["local"]["sync"]["peers"] = [
+            dict(self.peer, url="HTTP://NODE-A/", api_key="receiver-key")]
+        save_config(cfg)
+        requests = Mock()
+        requests.get.return_value = self.response({"hostname": "node-a", "role": "active"})
+        with patch.object(peering, "_requests", requests):
+            response = self.client.post("/api/peers/p/test")
+        self.assertFalse(response.get_json()["ok"])
+        requests.get.assert_not_called()
+        peer = self.client.get("/api/peers").get_json()[0]
+        self.assertTrue(peer["is_self"])
+
     def test_background_sync_does_not_publish_a_draft(self):
         published = self.publish()
         cfg = self.edit()

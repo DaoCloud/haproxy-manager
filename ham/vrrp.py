@@ -4,7 +4,7 @@ from flask import jsonify
 from urllib.parse import urlsplit
 import socket
 
-from .base import PEER_TIMEOUT, _lock, _requests, app
+from .base import PEER_TIMEOUT, _lock, _requests, app, log
 from .config import load_config, save_config
 from . import apply
 
@@ -19,6 +19,21 @@ def keepalived_wanted(cfg):
 
 def cluster_vips(cfg):
     return [v.strip().split("/")[0] for v in (cfg["cluster"].get("vips") or "").splitlines() if v.strip()]
+
+
+def check_interface(cfg):
+    if not keepalived_wanted(cfg):
+        return
+    interface = cfg["local"]["keepalived"]["interface"]
+    interfaces = {i["name"]: i["addresses"] for i in apply.node_interfaces() if i["name"] != "lo"}
+    if interface not in interfaces:
+        raise ValueError("VIP interface %s does not exist on this node" % interface)
+    addresses = {a.split("/")[0] for a in interfaces[interface]
+                 if ":" not in a and a.split("/")[0] not in cluster_vips(cfg)}
+    source = cfg["local"]["keepalived"]["unicast_src"]
+    if not addresses or (source and source not in addresses):
+        raise ValueError("VIP interface %s needs a fixed IPv4 address matching "
+                         "local.keepalived.unicast_src" % interface)
 
 
 def resolve_host(host):
@@ -144,20 +159,42 @@ def derive_unicast(cfg):
     k = cfg["local"]["keepalived"]
     if not keepalived_wanted(cfg):
         return False
+    previous = cfg["_meta"].get("derived_unicast") or {}
+    if k.get("unicast_peer") and (
+            k["unicast_peer"] != previous.get("peers") or
+            k.get("unicast_src", "") != previous.get("source", "")):
+        if not k.get("unicast_src"):
+            k["unicast_src"] = local_vrrp_address(cfg)
+            return True
+        return False
     vips = cluster_vips(cfg)
     addrs = []
+    unresolved = []
     for p in cfg["local"]["sync"].get("peers") or []:
         if not p.get("enabled", True):
             continue
-        for ip in resolve_host(urlsplit(p.get("url") or "").hostname or ""):
+        resolved = resolve_host(urlsplit(p.get("url") or "").hostname or "")
+        if not any(ip not in vips for ip in resolved):
+            unresolved.append(p.get("name") or p.get("url"))
+        for ip in resolved:
             if ip not in vips and ip not in addrs:
                 addrs.append(ip)
                 break                        # one address per node
+    if unresolved:
+        if k.get("unicast_peer"):
+            log.warning("VRRP: retaining previous addresses; could not resolve peers %s",
+                        ", ".join(unresolved))
+            return False
+        raise ValueError("Cannot derive VRRP addresses for peers: %s. Configure business-network "
+                         "unicast addresses explicitly." % ", ".join(unresolved))
     new_peer = "\n".join(addrs) if addrs else ""
     new_src = local_vrrp_address(cfg) if addrs else ""
     if (k.get("unicast_peer") or "") == new_peer and (k.get("unicast_src") or "") == new_src:
         return False
     k["unicast_peer"], k["unicast_src"] = new_peer, new_src
+    cfg["_meta"]["derived_unicast"] = {"peers": new_peer, "source": new_src}
+    log.info("VRRP: derived source=%s peers=%s", new_src or "(interface default)",
+             new_peer.replace("\n", ", ") or "(multicast)")
     return True
 
 
