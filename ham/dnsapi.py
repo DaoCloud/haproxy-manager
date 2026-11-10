@@ -631,18 +631,17 @@ def wizard_publish(cfg, pubs, tgts, name=None, want_cert=True, account=None,
         act("created", "Backend Pool", pool["name"])
 
     # -- TCP: a listening port sent straight to the pool ------------------
-    # TCP carries no host name, so a port serves exactly one pool: no
-    # conditions, no rules, just bind + default_backend.
+    # TCP carries no routing host name, so each address:port serves one pool:
+    # no conditions, no rules, just bind + default_backend.
     if is_tcp:
-        fe = None
-        if service_id and service_id.startswith("fe:"):
-            fe = _by_id(hp["frontends"]).get(service_id[3:])
-            if fe:                       # the port may be what changed
-                fe["binds"] = "%s:%d" % (pub["host"] or "0.0.0.0", pub["port"])
-                clash = wizard._find(hp["frontends"], lambda f: f is not fe and pub["port"] in wizard._bind_ports(f))
-                if clash:
-                    raise ValueError("port %d is already used by \"%s\"" % (pub["port"], clash["name"]))
-        fe = fe or wizard._find(hp["frontends"], lambda f: pub["port"] in wizard._bind_ports(f))
+        host = pub["host"] or "0.0.0.0"
+        address = (host.strip("[]").lower(), pub["port"])
+        fe = existing_fe or wizard._find(
+            hp["frontends"], lambda f: address in wizard._bind_addresses(f))
+        clash = wizard._find(hp["frontends"], lambda f: f is not fe and
+                             wizard._bind_conflicts(f, host, pub["port"]))
+        if clash:
+            raise ValueError("port %d is already used by \"%s\"" % (pub["port"], clash["name"]))
         if fe:
             if fe.get("mode") != "tcp":
                 raise ValueError("port %d is already used by the HTTP service \"%s\"" % (pub["port"], fe["name"]))
@@ -650,13 +649,15 @@ def wizard_publish(cfg, pubs, tgts, name=None, want_cert=True, account=None,
                 other = _by_id(hp["backends"]).get(fe["default_backend"])
                 raise ValueError("port %d already forwards to the pool \"%s\"; delete that service first"
                                  % (pub["port"], other["name"] if other else "?"))
+            if existing_fe:
+                fe["binds"] = "%s:%d" % (host, pub["port"])
             fe["default_backend"] = pool["id"]
             act("updated", "Public Service", fe["name"])
         else:
             fe = {"id": str(uuid.uuid4()),
                   "name": wizard._uniq_name({f["name"] for f in hp["frontends"]}, base + "-listener"),
                   "enabled": True, "mode": "tcp",
-                  "binds": "%s:%d" % (pub["host"] or "0.0.0.0", pub["port"]),
+                  "binds": "%s:%d" % (host, pub["port"]),
                   "ssl_enabled": False, "certificates": [], "rules": [],
                   "default_backend": pool["id"], "custom": ""}
             hp["frontends"].append(fe)

@@ -3,6 +3,8 @@ x-node: &node
   build:
     context: ../..
   cap_add: [NET_ADMIN, NET_BROADCAST, NET_RAW]
+  sysctls:
+    net.ipv4.ip_nonlocal_bind: "1"
   environment:
     HAM_ADMIN_USER: admin
     HAM_ADMIN_PASSWORD: lab-demo-password
@@ -52,7 +54,9 @@ services:
       LAB_B: ${LAB_B:?}
       LAB_BACKEND: ${LAB_BACKEND:?}
       LAB_VIP: ${LAB_VIP:?}
+      LAB_VIP_2: ${LAB_VIP_2:?}
       LAB_PROJECT: ${LAB_PROJECT:?}
+      LAB_STARTUP_TEST: ${LAB_STARTUP_TEST:-0}
     networks:
       lab:
         ipv4_address: ${LAB_BACKEND:?}

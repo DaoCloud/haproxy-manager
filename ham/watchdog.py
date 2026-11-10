@@ -17,7 +17,7 @@ from .base import (CLUSTER_POLL_SECONDS, HAPROXY_CFG, KEEPALIVED_CFG, PORT,
     STATS_SOCK, WATCHDOG_PROBE_TIMEOUT, WATCHDOG_SELF_TIMEOUT, _lock, app, log)
 from .config import load_config, save_config
 from .util import run
-from . import apply, cluster, hass, notify, probe, sync, traffic, vrrp, webui
+from . import apply, cluster, hass, notify, probe, startup, sync, traffic, vrrp, webui
 
 #
 # `systemctl is-active` answers "is the process there", which is not the
@@ -500,7 +500,8 @@ def _watchdog_loop():
             except Exception:
                 log.exception("watchdog: the round failed")
             try:
-                _restore_webui_if_lost()
+                if not startup.blocks_sync():
+                    _restore_webui_if_lost()
             except Exception:
                 log.exception("watchdog: checking the management UI service failed")
             _check_addresses(cfg)

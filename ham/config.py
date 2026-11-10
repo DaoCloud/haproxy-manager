@@ -249,6 +249,30 @@ def _merge_defaults(dst, src):
     return dst
 
 
+def _structure_error(cfg, defaults=DEFAULT_CONFIG, path="config"):
+    if not isinstance(cfg, dict):
+        return "%s must be an object" % path
+    for key, value in defaults.items():
+        if key not in cfg:
+            continue
+        where = "%s.%s" % (path, key)
+        if isinstance(value, dict):
+            error = _structure_error(cfg[key], value, where)
+            if error:
+                return error
+        elif isinstance(value, list):
+            if not isinstance(cfg[key], list):
+                return "%s must be an array" % where
+            if where != "config.crowdsec.skip_lists":
+                for item in cfg[key]:
+                    if not isinstance(item, dict):
+                        return "%s entries must be objects" % where
+                    for field in ("id", "name"):
+                        if field in item and not isinstance(item[field], str):
+                            return "%s.%s must be a string" % (where, field)
+    return ""
+
+
 CLUSTER_KEYS = ("vrid", "vips", "auth_pass", "advert_int", "state",
                 "nopreempt", "track_haproxy", "track_mode", "custom")
 
@@ -292,9 +316,13 @@ def load_config():
     """
     cfg = {}
     unreadable = False
+    read_error = ""
     if CONF_PATH.exists():
         try:
             cfg = json.loads(CONF_PATH.read_text())
+            error = _structure_error(cfg)
+            if error:
+                raise ValueError(error)
         except (ValueError, OSError) as e:
             # The file is there but will not parse. Returning bare defaults
             # here would make the node look like it has never been set up --
@@ -304,7 +332,7 @@ def load_config():
             # refuses, so a corrupt file fails closed rather than open.
             log.error("config.json exists but will not parse (%s); refusing to "
                       "treat this as first-run setup", e)
-            cfg, unreadable = {}, True
+            cfg, unreadable, read_error = {}, True, str(e)
     # An upgrade that adds a collection the stored file never had -- address
     # lists and error pages in 2.0 -- must not read as an unapplied change:
     # nothing HAProxy serves is different. The marker the last Apply stored
@@ -323,6 +351,7 @@ def load_config():
         cfg["_meta"]["applied_hash"] = config_hash(cfg)
     if unreadable:
         cfg["_meta"]["unreadable"] = True
+        cfg["_meta"]["config_error"] = read_error
     _move_node_objects_into_local(cfg)
     return cfg
 

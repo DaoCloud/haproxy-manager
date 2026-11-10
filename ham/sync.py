@@ -17,7 +17,8 @@ from .base import (CERT_DIR, PEER_CONNECT_TIMEOUT, PEER_READ_TIMEOUT,
 from .config import (DEFAULT_CONFIG, _merge_defaults, load_config, save_config,
                      shared_fingerprint, shared_snapshot)
 from .util import cert_path
-from . import apply, auth, cluster, peering, webui
+from . import apply, auth, cluster, peering, startup, vrrp, webui
+from .validate import check_file_config
 
 # --------------------------------------------------------------------------
 
@@ -153,8 +154,7 @@ def push_to_peer(peer, payload):
 def mesh_for(cfg, target):
     """The membership list to hand one node: everyone except itself, plus us.
 
-    Only this node knows its own API key, so it is the only one that can give
-    the others a working way back to it.
+    This node advertises its URL and configured key so the receiver can reach it.
     """
     me = (cfg["local"].get("node_url") or "").rstrip("/")
     out = []
@@ -289,7 +289,7 @@ def reconcile(cfg, nodes):
 
     Only the node holding the virtual IP pushes, but either node can catch up.
     """
-    if _requests is None or not enabled_peers(cfg):
+    if startup.blocks_sync() or _requests is None or not enabled_peers(cfg):
         return []
     # The same setting that pushes after an Apply. Someone who keeps their
     # nodes in step by hand does not want a background thread deciding to.
@@ -351,6 +351,8 @@ def catch_up(cfg):
     the virtual IP, nothing pushes to it at all. Used at startup and when the
     watchdog observes a recoverable publication.
     """
+    if startup.blocks_sync():
+        return None
     peers = enabled_peers(cfg)
     if _requests is None or not peers or not cfg["local"]["sync"].get("auto_sync"):
         return None
@@ -419,6 +421,8 @@ def api_sync_push():
     node that was edited while it was passive takes it instead of refusing it.
     That is the only way to discard a change made on the wrong node.
     """
+    if startup.busy():
+        return jsonify({"ok": False, "error": "Startup arbitration is in progress; retry shortly."}), 409
     body = request.get_json(silent=True) or {}
     cfg = load_config()
     if body.get("overwrite"):
@@ -473,17 +477,21 @@ def api_sync_receive():
         return _receive_locked(cfg, data, conf)
 
 
-def _receive_locked(cfg, data, conf, source=None):
+def _receive_locked(cfg, data, conf, source=None, startup_apply=False):
     cfg = load_config()          # re-read inside the lock: it may have moved
+    blocked = startup.receive_error(force=bool(data.get("force")), cfg=cfg)
+    if blocked and not startup_apply:
+        log.warning("sync receive refused during startup: %s", blocked)
+        return jsonify({"ok": False, "error": blocked}), 409
     # Named for the log: a push says who connected, a catch-up says who was asked.
     source = source or request.remote_addr
 
     # A node that was isolated, edited and then reconnected would otherwise
     # push its old configuration over the current one and nobody would know.
     # It is refused unless the caller says to overwrite deliberately.
-    mine = int(cfg["_meta"].get("shared_rev") or 0)
+    mine = 0 if startup.waiting(cfg) else int(cfg["_meta"].get("shared_rev") or 0)
     theirs = int(data.get("rev") or 0)
-    if theirs and theirs < mine and not data.get("force"):
+    if theirs and theirs < mine and not data.get("force") and not startup_apply:
         log.warning("refused a configuration from %s: revision %d is older than %d",
                     source, theirs, mine)
         return jsonify({
@@ -496,7 +504,7 @@ def _receive_locked(cfg, data, conf, source=None):
                      % (socket.gethostname(), mine, theirs, socket.gethostname(),
                         socket.gethostname())}), 409
     if theirs and theirs == mine and data.get("fp") and \
-            data["fp"] != shared_fingerprint(cfg) and not data.get("force"):
+            data["fp"] != shared_fingerprint(cfg) and not data.get("force") and not startup_apply:
         return jsonify({"ok": False, "conflict": True, "error":
                         "Conflicting configurations at revision %d. Choose the correct node "
                         "and use Overwrite explicitly." % mine}), 409
@@ -539,7 +547,7 @@ def _receive_locked(cfg, data, conf, source=None):
             # Never list ourselves: by URL, or by our own key when no URL is set.
             if mine and p["url"].rstrip("/").lower() == mine:
                 continue
-            if my_key and p.get("api_key") == my_key:
+            if not mine and my_key and p.get("api_key") == my_key:
                 continue
             # A key corrected here must survive the next inbound list. The
             # sender speaks for itself, so its own entry wins; for every other
@@ -607,6 +615,13 @@ def _receive_locked(cfg, data, conf, source=None):
     if data.get("fp") and cfg["_meta"]["shared_fp"] != data["fp"]:
         return jsonify({"ok": False, "error":
                         "The received configuration does not match its fingerprint."}), 422
+    if startup.ENABLED:
+        try:
+            check_file_config(cfg)
+            vrrp.check_interface(cfg)
+        except ValueError as error:
+            log.warning("sync refused invalid file configuration: %s", error)
+            return jsonify({"ok": False, "error": str(error)}), 422
     ok, message = apply.check_rendered(cfg, certificates=certificates)
     if not ok:
         log.warning("refused invalid configuration from %s: %s", source, message)
@@ -622,7 +637,7 @@ def _receive_locked(cfg, data, conf, source=None):
     cluster.invalidate()
     log.info("received configuration from %s at revision %d",
              source, cfg["_meta"]["shared_rev"])
-    res = apply.do_apply(cfg, allow_push=False)  # never re-push: avoids sync loops
+    res = apply.do_apply(cfg, allow_push=False, startup_apply=startup_apply)
     return jsonify({"ok": res.get("local_ok", False), "node": socket.gethostname(),
                     "error": res.get("error"), "applied": res,
                     "applied_rev": cfg["_meta"].get("applied_rev"),

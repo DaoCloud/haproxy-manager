@@ -52,6 +52,14 @@ case "$action" in
             waited=$((waited + 1))
         done
         if [ "$(state "$unit")" = "RUNNING" ]; then
+            # RUNNING can still be haproxy-run waiting for its first config.
+            # Restart that wrapper after writing the config; never send it USR2.
+            if [ "$unit" = "haproxy" ] && \
+               [ "$(cat /run/haproxy/haproxy.pid 2>/dev/null)" != "$($SUPERVISORCTL pid haproxy)" ]; then
+                echo "haproxy master is not ready; starting it with the generated configuration"
+                $SUPERVISORCTL restart "$unit"
+                exit $?
+            fi
             case "$unit" in
                 haproxy)    sig=USR2 ;;
                 keepalived) sig=HUP ;;

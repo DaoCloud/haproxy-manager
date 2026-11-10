@@ -1,402 +1,256 @@
-# 双节点生产部署：Docker 与 API 初始化
+# 双节点生产部署：多 VIP 四层转发
 
-本文面向两台独立的 Linux 主机：每台通过 `docker run` 运行一个包含 manager、
-HAProxy 和 Keepalived 的容器，共用一个 VIP，通过 API 下发 TCP 转发规则。
-两台节点都加载完整规则，只有持有 VIP 的节点接收 VIP 流量。
+两台独立的 Linux 主机各运行一个包含 manager、HAProxy 和 Keepalived 的容器，
+使用宿主机网络，通过多个业务 VIP 对接不同的 TCP 服务。
+用户接入 VPN 后，直接访问内部 `VIP:端口`，不依赖域名，不需要暴露到公网。
 
-这与[单机容器实验环境](get-started-lab.md)不同：这里使用宿主机网络，
-VIP 位于实际业务网络中，不使用实验环境的 Docker bridge。
+HAProxy 只做 TCP passthrough，不终止业务 TLS，也不根据 URL path 分流。
+每个服务有独立的 `VIP:端口`，backend 无需适配 `/app/` 这样的代理路径前缀。
+所有 VIP 属于同一个 VRRP instance，由当前 active 节点一起持有，故障时整体漂移到另一节点。
+这不是每个 VIP 独立选主，也不是双节点同时分担不同 VIP。
 
-## 1. 网络与部署前提
+首次部署时，A 提供共享 VIP 和规则，B 只提供本机身份和 peer。
+两边启动后自动应用配置，无需调用 create、join 或 Apply API 初始化。
+B 首次同步后保存完整配置，之后可独立重启并接管全部 VIP。
+配置保存在各节点的 `/opt/haproxy-manager/data/manager/config.json`，不要让两节点共用数据目录。
 
-以下均为文档示例地址，部署前替换为实际值：
+## 1. 网络与镜像
+
+下面都是示例值，部署前替换为自己的内部地址：
 
 | 对象 | 示例 |
 |---|---|
-| 节点 A | `192.0.2.11`，主机名 `proxy-a` |
-| 节点 B | `192.0.2.12`，主机名 `proxy-b` |
-| VIP | `192.0.2.100/24` |
-| 两节点承载 VIP 的接口 | `eth0`，可分别使用不同的实际接口名 |
+| 节点 A / B 的固定管理地址 | `10.20.0.11` / `10.20.0.12` |
+| 业务 VIP | `10.20.0.100/24`、`10.20.0.101/24` |
+| 承载 VIP 的业务接口 | 两边都是 `eth0`，实际名称可以不同 |
 | VRID | `77`，同一网络中不得与其他 VRRP 集群冲突 |
-| backend | `198.51.100.20:8080` 提供 HTTP，`:8443` 提供 HTTPS |
+| app backend | `10.30.0.20:8443`，HTTPS |
+| monitor backend | `10.30.0.21:9443`，HTTPS |
 
-两台主机需要 rootful Docker，并具备 `bash`、`curl`、`jq`、`openssl`、
-`iproute2` 和 SSH 工具。以下宿主机部署命令以 root 身份执行。
+两台主机需要 rootful Docker、Bash、curl、jq 和 iproute2。宿主机命令以 root 执行。
+本方案不需要在代理主机准备业务证书、私钥或 OpenSSL。
 
-部署前确认：
+- 所有 VIP 都使用指定的业务接口。两节点必须位于可让这些 VIP 漂移的业务网络，
+  网络允许 ARP 更新及两节点之间的 **IP 协议 112（VRRP）**，不是 TCP/UDP 的 112 端口。
+  云平台对辅助 IP 的限制需先处理，VIP 不能与其他设备的固定地址冲突。
+- VPN 客户端需要到全部 VIP 的路由，网络需要允许相应 TCP 端口，并保证回程可达。
+  两个代理节点都必须能访问全部 backend。
+- 管理端口 TCP 8080 只允许集群节点和授权管理主机访问，不要开放给普通 VPN 用户或公网。
+- 以下 HTTP 管理连接不加密密码、API key 或同步内容，只适用于隔离、可信网络。
+  跨不可信网络时，先建立经过认证的加密通道。VRRP 的 PASS 认证不能替代加密。
+- 宿主机不能有其他服务占用相同监听地址和端口，也不能有其他 Keepalived 管理这些 VIP。
 
-- 两节点的业务接口可以通过 VRRP 互通，网络允许 VIP 漂移及相应的 ARP 更新。
-  云平台若限制辅助 IP 或禁止地址漂移，需先按平台要求配置，不能直接假定 Keepalived 可用。
-- 双向放行两节点之间的 **IP 协议 112（VRRP）**，不是 TCP/UDP 的 112 端口。
-  加入完成后使用 unicast VRRP，初始化期间不要提前将 VIP 接入正式业务。
-- 管理端口 TCP 8080 只允许集群节点和授权管理主机访问。业务客户端允许访问 VIP 的
-  TCP 80/443，两个代理节点均需能访问 backend。
-- 宿主机上没有占用相同监听地址和端口的服务，也没有管理同一 VIP 的其他 Keepalived 实例。
+在每台主机执行 `ip -br -4 addr`，确认承载 VIP 的接口及固定 IPv4 地址。
+部署脚本的 `--interface-a/b` 和 `--vrrp-ip-a/b` 指定 Keepalived 使用的业务网接口和地址。
+`--ip-a/b` 是管理连接地址，可以在另一张网卡上，**不能填任何 VIP**。
 
-**下方管理 API 使用 HTTP，要求在隔离、可信的网络中执行。**
-它不加密管理员密码、API key 或同步内容。跨不可信网络时，必须先建立经过认证的加密通道，
-或部署具有可信证书的 HTTPS 管理入口，并启用 peer 的 TLS 校验。
-不要将 8080 直接暴露到公网，也不要把 VRRP 的 PASS 认证当成加密保护。
+HAProxy 按规则里的 `VIP:端口` 监听，不按网卡名称监听。
+backend 访问和业务回包由宿主机路由决定。默认由 HAProxy 新建到 backend 的 TCP 连接，
+backend 看到的源地址通常是代理节点的出站地址，而不是 VPN 客户端地址。
 
-### 多网卡主机如何选择接口
-
-先在每台主机执行以下命令，确认实际接口名及其 IPv4 地址：
-
-```bash
-ip -br -4 addr
-```
-
-第 4 节的 `VIP_INTERFACE_A` 和 `VIP_INTERFACE_B` 是部署脚本变量，分别填写两台主机上
-承载业务 VIP 的接口名，例如 `ens192` 和 `enp1s0`。脚本将它们传给 manager 初始化 API
-的请求体字段 `interface`，让各节点的 Keepalived 在指定接口上发送 VRRP 报文、添加或移除 VIP。
-该接口必须已有本机固定 IPv4 地址，且能与另一节点的业务接口通信，不要直接照抄 `eth0`。
-
-**HAProxy 监听的是业务规则中指定的 VIP 和端口，不是网卡名称。**
-因此 `docker run` 无需另设 HAProxy 网卡参数。访问 backend 和业务回包走哪张网卡，
-仍由宿主机路由及策略路由决定，需要按实际网络检查。节点的 API 地址可以使用独立管理网的固定 IP，
-不必与 VIP 位于同一接口，但必须能被另一节点和部署控制端访问。
-
-## 2. 拉取仓库发布的镜像
-
-直接使用本仓库发布到 GitHub Container Registry 的镜像，不需要本地构建或传输镜像归档。
-在**两台主机上分别**执行：
+两台使用支持预置配置启动和共享 API key 的同一个镜像版本，可以提前拉取并查询 digest：
 
 ```bash
 docker pull ghcr.io/daocloud/haproxy-manager:latest
 docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/daocloud/haproxy-manager:latest
 ```
 
-确认两台主机输出的仓库 digest 一致。`latest` 会随发布更新；如果两次拉取之间发生了发布，
-应改用同一个 `ghcr.io/daocloud/haproxy-manager@sha256:...` 引用重新拉取，
-并将下一节脚本中的 `IMAGE` 改为该引用。
+部署脚本会自行拉取 `--image` 指定的镜像。`latest` 可能更新，生产部署建议将下方 `--image`
+固定为同一个 `ghcr.io/daocloud/haproxy-manager@sha256:...`，两台 digest 必须一致。
 
-## 3. 在两台主机分别运行容器
+## 2. 准备参数并启动
 
-下面是**首次部署**流程，不要对已有集群重复生成 API key 或重新运行初始化接口。
-确认宿主机的 `/opt/haproxy-manager/data/` 中没有旧集群数据。
-已有安装应保留原来的数据和凭据，不要直接把原命名卷替换为空目录，否则会按全新安装启动。
+下面仅适用于**首次部署**。已有安装必须保留原来的数据目录、完整配置及凭据，
+不要用最小示例覆盖，也不要在每次重启时重新生成配置或 API key。
 
-在**每台主机**执行下面的脚本，先修改顶部变量。
-节点 A 使用 `NODE_NAME=proxy-a`、`NODE_IP=192.0.2.11`；
-节点 B 改为 `NODE_NAME=proxy-b`、`NODE_IP=192.0.2.12`。
+使用与镜像版本对应的[独立部署脚本](../tools/deploy-two-nodes-docker.sh)。
+下面的调用从仓库根目录执行；单独下载脚本时，将命令中的脚本路径替换为实际路径。
 
-`ADMIN_USER` 和 `ADMIN_PASSWORD` 是部署脚本变量，用于初始化 **manager Web UI 的管理员账号**，
-不是宿主机 root 密码，也不是 API key。两节点使用相同的 UI 登录凭据，脚本无需人工交互。
+在调用前手工填写 `API_KEY` 和 `ADMIN_PASSWORD`，两台使用相同的值。
+`API_KEY` 是两节点共用的同步认证 key，至少 32 个无空白的可见 ASCII 字符，不要求十六进制。
+`ADMIN_PASSWORD` 是 **manager Web UI 管理员**的初始密码，至少 16 位、单行，
+不是 root 密码，也不是节点 API key。下方凭据仅为格式示例，实际部署必须替换，不要直接使用。
+
+这种手工变量与命令行传参方式会使凭据出现在 shell history、已填写的脚本及运行中的进程参数中。
+仅在受控管理环境使用，不要将真实值提交到 Git、复制到公共日志或分享。
 
 ```bash
-set -euo pipefail
-
-# 按当前节点修改名称和固定 API 地址。
-NODE_NAME=proxy-a
-NODE_IP=192.0.2.11
-IMAGE=ghcr.io/daocloud/haproxy-manager:latest
-DATA_DIR=/opt/haproxy-manager/data
-
-# UI 管理员账号，不是 root 账号。必须将密码改为至少 16 位的单行强密码，两节点保持一致。
-ADMIN_USER=admin
-ADMIN_PASSWORD='CHANGE_ME'
-
-if [ "$ADMIN_PASSWORD" = CHANGE_ME ] || [ "${#ADMIN_PASSWORD}" -lt 16 ]; then
-  echo "请先修改顶部 ADMIN_PASSWORD，使用至少 16 位的 UI 管理员密码。" >&2
-  exit 1
-fi
-
-umask 077
-mkdir -p "$DATA_DIR"/{manager,acme,haproxy,keepalived}
-cd /opt/haproxy-manager
-
-if [ -e manager.env ] || [ -e api-header ]; then
-  echo "已存在部署凭据，请勿重复初始化。" >&2
-  exit 1
-fi
-
-printf 'HAM_ADMIN_USER=%s\nHAM_ADMIN_PASSWORD=%s\nHAM_LISTEN=0.0.0.0\n' \
-  "$ADMIN_USER" "$ADMIN_PASSWORD" > manager.env
-unset ADMIN_PASSWORD
-
-printf 'net.ipv4.ip_nonlocal_bind = 1\n' \
-  > /etc/sysctl.d/90-haproxy-manager.conf
-sysctl -p /etc/sysctl.d/90-haproxy-manager.conf
-
-docker run -d \
-  --name haproxy-manager \
-  --hostname "$NODE_NAME" \
-  --network host \
-  --restart unless-stopped \
-  --cap-add NET_ADMIN \
-  --cap-add NET_BROADCAST \
-  --cap-add NET_RAW \
-  --env-file /opt/haproxy-manager/manager.env \
-  -v "$DATA_DIR/manager:/var/lib/haproxy-manager" \
-  -v "$DATA_DIR/acme:/var/lib/acme.sh" \
-  -v "$DATA_DIR/haproxy:/etc/haproxy" \
-  -v "$DATA_DIR/keepalived:/etc/keepalived" \
-  "$IMAGE"
-
-for attempt in $(seq 1 60); do
-  if curl --noproxy '*' -fsS --connect-timeout 2 --max-time 3 \
-    "http://$NODE_IP:8080/api/whoami" > /dev/null; then
-    break
-  fi
-  sleep 1
-done
-curl --noproxy '*' -fsS --connect-timeout 2 --max-time 3 \
-  "http://$NODE_IP:8080/api/whoami" > /dev/null
-
-API_KEY=$(openssl rand -hex 32)
-printf '%s' "$API_KEY" | docker exec -i haproxy-manager \
-  python3 /opt/haproxy-manager/app.py set-api-key -
-printf 'X-API-Key: %s\n' "$API_KEY" > api-header
-unset API_KEY
+# 32 字符随机示例，仅供展示；实际部署必须替换，至少 32 个无空白可见 ASCII 字符，两台一致。
+API_KEY='a0ec4e1d0d80b23ce15a3069f70abcdb'
+# 16 字符随机示例，仅供展示；实际部署必须替换，至少 16 个字符、单行，两台一致。
+ADMIN_PASSWORD='K0Xpv!cc!!t#amhI'
 ```
 
-这些设置的作用是：
+在两台宿主机分别执行 `hostname`，将实际输出填入下面的 `--hostname-a/b`，包括已有的域名后缀。
+修改好一组参数后，**两台以 root 执行完全相同的命令，各一次**，顺序不限：
 
-- Docker 的 `--network host` 让容器使用宿主机网络，不再使用 `-p` 做端口映射。
-  Keepalived 在宿主机接口上管理 VIP，HAProxy 也直接绑定宿主机地址。
-- manager 容器的环境变量 `HAM_LISTEN=0.0.0.0` 让 UI/API 监听宿主机全部 IPv4 接口，
-  包括镜像健康检查和进程内探测使用的 `127.0.0.1`。须按第 1 节限制 8080 的访问范围，
-  集群成员仍使用各自的固定 IP 互相访问。`HAM_ADMIN_USER=admin` 和
-  `HAM_ADMIN_PASSWORD` 只在没有管理员时初始化登录。
-- 宿主机内核参数 `net.ipv4.ip_nonlocal_bind=1` 允许 standby 节点的 HAProxy 提前绑定尚未持有的 VIP。
-  这是宿主机级配置，会影响其他进程，应先确认符合本机安全策略。
-- Docker 的四条 `-v` 将同一个宿主机数据目录下的子目录映射到镜像现有路径：
+```bash
+bash tools/deploy-two-nodes-docker.sh \
+  --hostname-a proxy-a --hostname-b proxy-b \
+  --ip-a 10.20.0.11 --ip-b 10.20.0.12 \
+  --interface-a eth0 --interface-b eth0 \
+  --vrrp-ip-a 10.20.0.11 --vrrp-ip-b 10.20.0.12 \
+  --vip 10.20.0.100/24 \
+  --vip 10.20.0.101/24 \
+  --vrid 77 \
+  --api-key "$API_KEY" \
+  --admin-password "$ADMIN_PASSWORD" \
+  --image ghcr.io/daocloud/haproxy-manager:latest \
+  --tcp-forward app 10.20.0.100:443 10.30.0.20 8443 \
+  --tcp-forward monitor 10.20.0.101:443 10.30.0.21 9443
+```
 
-| 宿主机目录 | 容器目录 | 保存内容 |
+部署后的映射为：
+
+| VPN 客户端访问 | backend 连接目标 |
+|---|---|
+| `https://10.20.0.100/` | `10.30.0.20:8443` |
+| `https://10.20.0.101/` | `10.30.0.21:9443` |
+
+重复 `--vip` 声明多个 VIP，重复 `--tcp-forward` 定义转发规则。
+每条规则填写**规则名、入口 VIP:端口、backend 地址、backend 端口**。
+规则名只是 manager 中的名称，不是域名。
+不同 VIP 可以使用相同端口；同一个 VIP 也可以使用不同端口，例如在首次部署命令中追加
+`--tcp-forward extra 10.20.0.101:8443 10.30.0.22 443`。
+
+只声明一个 `--vip` 时，仍兼容原来的端口简写，例如
+`--tcp-forward app 443 10.30.0.20 8443`。声明多个 VIP 时，每条规则必须明确填写 `VIP:端口`，
+脚本不会猜测规则属于哪个 VIP。
+
+### HTTPS 和应用行为
+
+HTTPS 的 TLS 握手直接发生在客户端与 backend 之间，**证书和私钥只由 backend 持有**。
+代理不生成入口证书，不读取业务 TLS 私钥，也不校验或替换 backend 证书。
+这不代表客户端会自动信任证书：如果客户端严格校验，
+backend 证书的 IP SAN 必须覆盖对应访问 VIP，并且证书或签发 CA 必须被客户端信任。
+同一个 backend 经多个 VIP 提供 HTTPS 时，应让其证书覆盖这些访问 VIP。
+
+例如访问 `https://10.20.0.100/login?next=home`，
+app backend 收到的仍是 `/login?next=home`，没有 `/app/` 前缀。
+TCP passthrough 不改写 HTTP Host、响应中的重定向或 Cookie，也不添加 `X-Forwarded-*`。
+应用若在响应中硬编码内部 IP 或端口，四层代理不会自动把它改成 VIP。
+本脚本仅生成 TCP 规则，不提供 UDP 转发。
+
+### 参数与初始化行为
+
+| 参数 | 要求与默认值 |
+|---|---|
+| `--hostname-a/b` | 必填，两个不同的宿主机 hostname，必须与本机实际输出精确匹配 |
+| `--ip-a/b` | 必填，两个不同的固定管理 IPv4 地址，管理端口为 TCP 8080 |
+| `--interface-a/b` | 必填，各节点承载全部 VIP 的非 loopback 接口 |
+| `--vrrp-ip-a/b` | 必填，业务接口上的固定 IPv4 地址，可与管理地址相同 |
+| `--vip IPV4/PREFIX` | 至少一项，可重复；同一 IPv4 地址不能重复声明 |
+| `--vrid` | 必填，1–255；全部 VIP 共用这一个 VRID |
+| `--api-key` | 必填，两节点共用的认证 key，至少 32 个无空白的可见 ASCII 字符 |
+| `--admin-password` | 必填，UI 初始密码，至少 16 位、单行 |
+| `--tcp-forward NAME VIP:PORT BACKEND_ADDRESS BACKEND_PORT` | 至少一条，可重复；入口 VIP 必须已声明，backend 接受 IPv4 或可解析的 DNS 名 |
+| `--admin-user` | 默认 `admin` |
+| `--image` | 默认 `ghcr.io/daocloud/haproxy-manager:latest`，生产建议固定 digest |
+| `--data-dir` | 默认 `/opt/haproxy-manager/data`，必须是绝对路径且不存在或为空 |
+| `--priority-a/b` | 默认分别为 `150`、`100` |
+| `--help` | 查看完整用法 |
+
+转发规则名只能包含字母、数字、下划线和连字符，且以字母或数字开头。
+规则名及 `VIP:端口` 组合不得重复，TCP 8080 保留给管理入口。
+脚本检查 VIP、规则、凭据、本机接口与固定地址，以及 rootful Docker，并记录入口与 backend 映射。
+发现已有同名容器或非空数据目录时拒绝初始化，不覆盖已有安装。
+失败会输出错误并保留已经写入的文件，先检查现场，不要盲目重复初始化。
+日志中的“容器已启动”不代表 startup Apply 或双节点部署已成功，仍须完成第 3 节。
+
+脚本根据 hostname 自动选择 A/B，不需要 `NODE` 参数，也不会修改宿主机 hostname。
+A 写入全部共享 VIP 和 TCP 规则，B 只写入本机身份和 peer，随后通过启动机制同步。
+节点通过各自的管理 URL 和 hostname 区分，共用 API key 不会将对端当成本机。
+已有安装仍可保留各节点独立的 API key，不要求改成共享 key。
+
+manager 容器的环境变量 `HAM_APPLY_ON_START=1` 使进程每次启动时校验、协调并应用配置，
+是本镜像的默认值。`HAM_LISTEN=0.0.0.0` 使 UI/API 监听全部 IPv4 接口，
+包括健康检查所用的 `127.0.0.1`，需按第 1 节限制访问。
+`HAM_ADMIN_USER/PASSWORD` 只在没有管理员时初始化登录，不会重置已有账号。
+
+宿主机内核参数 `net.ipv4.ip_nonlocal_bind=1` 允许 standby 上的 HAProxy 提前绑定尚未持有的 VIP。
+这是宿主机级配置，会影响其他进程，执行前应确认符合本机安全策略。
+Docker 的 `--network host` 让 Keepalived 直接在宿主机业务接口上管理 VIP，不使用 `-p`。
+
+四条挂载沿用镜像现有目录布局，宿主机只需备份一个 `data/`：
+
+| 宿主机子目录 | 容器目录 | 保存内容 |
 |---|---|---|
-| `/opt/haproxy-manager/data/manager` | `/var/lib/haproxy-manager` | manager 配置 |
-| `/opt/haproxy-manager/data/acme` | `/var/lib/acme.sh` | ACME 账号、证书及续期状态 |
-| `/opt/haproxy-manager/data/haproxy` | `/etc/haproxy` | HAProxy 配置与证书 |
-| `/opt/haproxy-manager/data/keepalived` | `/etc/keepalived` | Keepalived 配置与健康检查脚本 |
+| `data/manager` | `/var/lib/haproxy-manager` | 配置、凭据及历史 |
+| `data/acme` | `/var/lib/acme.sh` | 保留镜像原有 ACME 目录，本方案不使用 |
+| `data/haproxy` | `/etc/haproxy` | HAProxy 配置 |
+| `data/keepalived` | `/etc/keepalived` | Keepalived 配置与健康检查脚本 |
 
-**宿主机只需管理和备份一个 `data/` 目录，但当前镜像仍需要四条挂载。**
-这些容器路径不在同一个可安全覆盖的目录下，不能仅将四条 `-v` 换成一条而保持现有镜像正常工作。
-不要为了减少挂载条数而覆盖容器的整个 `/etc` 或 `/var/lib`。
-两台主机分别保存自己的数据，不共用数据目录；重建容器时必须复用原目录。
+`data/manager.env` 保存容器启动环境，`data/api-header` 保存本机 API 请求头，均为 `0600`。
+使用自定义 `--data-dir` 时，后文的宿主机路径也要相应替换。
+**挂载整个 manager 目录，不要单独 bind `config.json`**，因为 manager 通过临时文件与原子替换保存配置。
+不要用一条挂载覆盖整个 `/etc` 或 `/var/lib`。
+配置、`manager.env`、`api-header` 和填写了真实凭据的部署脚本都应限制读取，不要提交到 Git 或公共日志。
 
-`manager.env` 含有初始管理员密码，`api-header` 含有当前节点的 API key。
-它们及填写了真实密码的部署脚本只应由授权管理员读取，不要提交到 Git、复制到工单或输出到公共日志。
-两个节点的 API key 必须不同。容器管理权限本身也必须严格限制。
+## 3. 确认启动结果
 
-此时 UI/API 可以访问，但**还没有业务转发规则**。
-Docker 的 healthy 仅表示管理接口能响应，不代表集群和业务已就绪。
+启动顺序不限。B 先启动时会等待 A 发布，不会用空共享配置覆盖 A。
+A 先启动时可独立应用，B 可用后会获取并应用 publication。
 
-## 4. 通过 API 初始化规则和集群
-
-后续命令统一在**节点 A 的同一个 Bash 会话**执行，作为部署控制端。
-将节点 B 的请求头文件通过 SSH 安全复制到节点 A：
+在**每个节点本机**查询：
 
 ```bash
-cd /opt/haproxy-manager
-scp root@192.0.2.12:/opt/haproxy-manager/api-header ./api-header-b
-chmod 600 api-header api-header-b
+curl --noproxy '*' -fsS --header @/opt/haproxy-manager/data/api-header \
+  'http://127.0.0.1:8080/api/status?brief=1' |
+  jq '{hostname,startup,role,vips,vip_held,published_rev,published_fp,applied_rev,applied_fp,apply_error}'
 
-A=http://192.0.2.11:8080
-B=http://192.0.2.12:8080
-VIP=192.0.2.100
-# 分别填写节点 A、B 上承载 VIP 的真实接口名，两节点可以不同。
-VIP_INTERFACE_A=eth0
-VIP_INTERFACE_B=eth0
-KEY_A=$PWD/api-header
-KEY_B=$PWD/api-header-b
-
-api() {
-  local base=$1 header=$2 method=$3 path=$4
-  shift 4
-  curl --noproxy '*' -fsS --connect-timeout 5 --max-time 240 \
-    --header "@$header" \
-    --header 'Content-Type: application/json' \
-    --request "$method" "$base$path" "$@"
-}
+docker logs --tail 100 haproxy-manager
 ```
 
-SSH 用户和凭据文件路径按本地运维规范调整。
-这里通过文件传递 `X-API-Key` 请求头，避免把 API key 直接写入 curl 的命令行参数。
-`A`、`B` 必须是各节点自己的地址，**不能使用 VIP**，否则同步可能访问到错误的节点。
+正式接入业务前必须确认：
 
-### 4.1 在节点 A 保存两条规则草稿
+- 两边 `startup.state=ready`、`startup.local_ok=true`，`apply_error` 为空。
+- 两边 `published_rev/published_fp` 一致且不为空，各自 `applied_rev/applied_fp` 等于 publication。
+- 两边 `vips` 包含全部已声明的 VIP。恰好一个节点为 `active`，其 `vip_held` 包含全部 VIP；
+  另一个节点为 `passive`，`vip_held` 为空。
 
-HTTP 流量也按 TCP 转发，不在代理上解析 HTTP：
+`startup` 描述本次进程启动，不是磁盘上上次成功的标记。
+`waiting_peer` 表示等待 peer 的 publication，约每 5 秒重试。
+`failed` 或 `conflict` 时查看 `startup.error` 和日志，不要强行覆盖草稿或 publication。
+等待日志使用 `startup: state=...` 标识阶段，定期输出进度，不输出 API key 或配置全文。
+
+容器 healthy 只表示 manager 能响应，不代表本次配置已应用。
+已存在的有效 HAProxy 配置可能先恢复旧业务，不能据此认定新文件已生效。
+
+从**接入 VPN 的业务客户端**按实际 IP 访问两个服务：
 
 ```bash
-jq -n --arg url "tcp://$VIP:80" \
-  '{name:"http-pass", url:$url, target:"tcp://198.51.100.20:8080",
-    certificate:false, health:{type:"tcp"}, apply:false}' |
-  api "$A" "$KEY_A" POST /api/wizard/publish --data-binary @- |
-  jq -e 'if .ok == true then del(.preview) else error(tostring) end'
+curl --noproxy '*' -fsS --cacert /path/to/app-ca.pem https://10.20.0.100/
+curl --noproxy '*' -fsS --cacert /path/to/monitor-ca.pem https://10.20.0.101/
 ```
 
-HTTPS 使用 TLS passthrough，代理不申请或加载业务 TLS 证书：
+CA 文件用于客户端信任对应 backend 的证书，不安装到代理节点。
+backend 证书已被客户端系统信任时可省略 `--cacert`；自签证书可用经过安全确认的 backend 公开证书。
+不要用 `-k` 代替生产证书验证。应分别获得 app 和 monitor 的响应，而不是 manager UI。
+还需确认登录、跳转、静态资源和业务功能正常，`startup.state=ready` 不能代替业务检查。
 
-```bash
-jq -n --arg url "tcp://$VIP:443" \
-  '{name:"https-pass", url:$url, target:"tcp://198.51.100.20:8443",
-    certificate:false, health:{type:"tcp"}, apply:false}' |
-  api "$A" "$KEY_A" POST /api/wizard/publish --data-binary @- |
-  jq -e 'if .ok == true then del(.preview) else error(tostring) end'
-```
+在维护窗口停止当前 active 容器，确认另一节点接管**全部 VIP**，并重新访问每个服务。
+再恢复原节点，检查应用版本一致。故障切换不保证已有 TCP 会话不中断，客户端需要支持重连。
 
-`/api/wizard/publish` 请求体中的 `apply:false` 只保存草稿，尚不影响运行中的转发。
-两个 `url` 都使用 VIP，而不是 `0.0.0.0`，使业务端口只绑定 VIP。
-`target` 必须使用 `tcp://` 才符合这里的 TLS passthrough 设计；
-不要将 HTTPS backend 改成 `https://` 后仍当作同一种配置。
+## 4. 后续修改与恢复
 
-### 4.2 在节点 A 创建集群并 Apply
+**平时使用 UI/API 修改当前 active 上的共享 VIP 和 TCP 规则，保存后执行 Apply。**
+保存但未 Apply 的内容仍是草稿，后台同步不会发布它。主动重启容器会尝试应用这些草稿。
+业务 TLS 证书在各自 backend 维护，不通过本部署脚本更新。
 
-下面将第 4 节顶部的 `VIP_INTERFACE_A` 传给创建接口，让节点 A 的 Keepalived 管理该接口上的 VIP：
+需要直接编辑文件时：
 
-```bash
-jq -n --arg url "$A" --arg vips "$VIP/24" --arg iface "$VIP_INTERFACE_A" \
-  '{mode:"cluster", node_url:$url, vips:$vips, vrid:77,
-    interface:$iface, priority:150, apply:true}' |
-  api "$A" "$KEY_A" POST /api/setup/create --data-binary @- |
-  jq -e '
-    if .ok == true and .applied.ok == true and .applied.local_ok == true
-    then del(.api_key)
-    else error((del(.api_key)) | tostring)
-    end'
-```
+1. 确认当前 active、对端健康及版本一致，备份该节点完整数据目录。
+2. 停止该节点容器，编辑现有 `data/manager/config.json`，不要重建最小配置或手工修改 `_meta`。
+3. 保留本机 `local` 身份和其他字段，通过 `jq empty config.json` 检查 JSON，再启动容器。
+4. 按第 3 节确认本次启动、双方应用版本及全部 VIP 的实际业务访问。
 
-接口会沿用已经设置的本机 API key，响应中的原始 key 被上述 jq 命令移除。
-这次 Apply 会生成 HAProxy/Keepalived 配置并加载前面保存的两条规则。
+接口、优先级、固定管理地址、API key 和 VRRP unicast 地址属于各节点自己的 `local`，
+不会通过共享同步覆盖。共享规则只维护一份，不要在两个节点分别修改后期待系统自动合并。
+manager 配置文件字段 `local.sync.auto_sync` 默认是 `true`，允许首次自动加入和后续后台同步。
+已有安装若设置为 `false`，启动只应用本机已有配置，不主动拉取 peer 或等待自动加入；
+这不会禁止接收对端推送，沿用原有同步语义。
+首次加入期间若保存了新的共享草稿，普通推送不会覆盖它，需要明确 Apply 或选择 Overwrite。
 
-检查节点 A，等待 `role` 为 `active`，且 `vip_held` 包含预期 VIP 后再继续：
-
-```bash
-api "$A" "$KEY_A" GET '/api/status?brief=1' |
-  jq '{hostname,role,vip_held,haproxy,keepalived,apply_error}'
-```
-
-### 4.3 将节点 B 加入集群
-
-下面使用 `VIP_INTERFACE_B` 指定节点 B 自己的接口。请求中的 peer key 是 A 的 key，
-并非 B 的 key：
-
-```bash
-jq -n --arg peer "$A" --arg url "$B" --arg iface "$VIP_INTERFACE_B" --rawfile header "$KEY_A" \
-  '{peer_url:$peer, node_url:$url,
-    peer_api_key:($header | sub("^X-API-Key: *"; "") | rtrimstr("\n")),
-    interface:$iface, priority:100}' |
-  api "$B" "$KEY_B" POST /api/setup/join --data-binary @- |
-  jq -e '
-    if .ok == true and .synced == true
-    then del(.api_key)
-    else error((del(.api_key)) | tostring)
-    end'
-```
-
-加入会注册双方关系，拉取并应用 A 已发布的规则。
-**只看到顶层 `ok:true` 不够，还必须确认 `synced:true` 并检查返回的 `steps`。**
-
-加入流程会保存各节点的 unicast VRRP 设置。随后在 A 再执行一次 Apply，
-使 A 也加载加入后的成员信息，并同步确认 B 的应用状态：
-
-```bash
-api "$A" "$KEY_A" POST /api/apply --data '{}' |
-  jq -e '
-    if .ok == true and .local_ok == true and .cluster_ok == true
-    then .
-    else error(tostring)
-    end'
-```
-
-## 5. 验证实际应用和业务访问
-
-分别查询两个节点：
-
-```bash
-api "$A" "$KEY_A" GET '/api/status?brief=1' |
-  jq '{hostname,role,vip_held,published_rev,published_fp,applied_rev,applied_fp,apply_error}'
-api "$B" "$KEY_B" GET '/api/status?brief=1' |
-  jq '{hostname,role,vip_held,published_rev,published_fp,applied_rev,applied_fp,apply_error}'
-```
-
-接入正式业务前，必须确认：
-
-- 恰好一个节点为 `active` 并持有 VIP，另一个为 `passive`。
-- 两节点的 `published_rev`、`published_fp` 一致，且 fingerprint 不为空。
-- 每个节点的 `applied_rev/applied_fp` 等于自己的 `published_rev/published_fp`，
-  `apply_error` 为空。不能只检查 HTTP 200、容器 healthy 或配置版本相同。
-
-从能路由到业务 VIP 的客户端测试 HTTP：
-
-```bash
-curl --noproxy '*' -fsS http://192.0.2.100/
-```
-
-假设 backend 的 TLS 证书对应真实业务域名 `service.example.com`，验证 HTTPS：
-
-```bash
-curl --noproxy '*' -fsS \
-  --resolve service.example.com:443:192.0.2.100 \
-  https://service.example.com/
-```
-
-将域名替换为实际证书对应的域名。curl 的 `--resolve` 将该域名定向到 VIP，
-同时保留正确的 Host 和 TLS SNI，并正常校验证书。
-如果 backend 使用内部 CA，可给 curl 增加 `--cacert /path/to/ca.pem` 来信任相应 CA，
-不要用 `-k` 代替生产证书验证。应获得 backend 的实际业务响应，而不是 manager UI。
-
-## 6. 后续快速下发规则
-
-从第 5 节的状态中找到当前 `active` 节点，选择它的地址和请求头文件。
-**不要始终固定写入节点 A**，因为加入、故障或维护后 active 可能变为 B。
-下面假设当前 active 是 A；如果是 B，将两个变量分别改为 `$B` 和 `$KEY_B`：
-
-```bash
-ACTIVE=$A
-ACTIVE_HEADER=$KEY_A
-```
-
-例如用一次 API 请求新增 `VIP:9000 -> backend:8080`，并立即应用、同步到另一个节点：
-
-```bash
-jq -n --arg url "tcp://$VIP:9000" \
-  '{name:"extra-tcp", url:$url, target:"tcp://198.51.100.20:8080",
-    certificate:false, health:{type:"tcp"}, apply:true}' |
-  api "$ACTIVE" "$ACTIVE_HEADER" POST /api/wizard/publish --data-binary @- |
-  jq -e '
-    if .ok == true and .applied.ok == true and
-       .applied.local_ok == true and .applied.cluster_ok == true
-    then del(.preview)
-    else error((del(.preview)) | tostring)
-    end'
-```
-
-这里请求体的 `apply:true` 会在保存规则后执行 Apply，成功后将已发布版本推送到 peer。
-响应的顶层 `ok` 只说明创建规则的请求成功，实际应用结果在 `applied` 中。
-批量创建时，将各请求的 `apply` 设为 `false`，最后统一调用一次 `/api/apply`。
-
-如果已经有通过 `/api/export/config` 导出的 manager JSON 备份，也可在当前 active 上导入：
-
-```bash
-api "$ACTIVE" "$ACTIVE_HEADER" POST /api/import/config \
-  --data-binary @services-backup.json |
-  jq -e 'if .ok == true then . else error(tostring) end'
-api "$ACTIVE" "$ACTIVE_HEADER" POST /api/apply --data '{}' |
-  jq -e '
-    if .ok == true and .local_ok == true and .cluster_ok == true
-    then .
-    else error(tostring)
-    end'
-```
-
-**导入会替换备份中包含的共享配置部分，并非追加规则，导入前应先备份。**
-它不替换各节点的本地身份，也不会自动 Apply。
-这里的备份是 manager JSON，不是原生 `haproxy.cfg`，且不包含完整的本机设置和证书私钥。
-
-如果返回 `local_ok:true`、`cluster_ok:false`，表示本机已应用，但另一节点没有确认成功，
-不能当作双节点部署完成，也不会自动回滚本机。检查 `error`、`sync` 和 peer 的 `apply_error`，
-恢复后重新查询两节点状态。不要在失败后盲目重复新增同一条规则。
-
-## 7. 运维注意事项
-
-- 先在维护窗口验证停止 active 容器后 VIP 是否转移，再恢复该容器，确认自动补同步和业务访问。
-  恢复后的节点不一定立即抢回 VIP，应以实际角色为准。VIP 切换不保证已有 TCP 会话保持。
-- `--restart unless-stopped` 不能解决“进程仍存活但卡死”的情况，
-  Docker 也不会仅因 unhealthy 自动重启容器。需要外部监控、告警和受控恢复机制。
-- 保护并备份整个 `/opt/haproxy-manager/data/` 目录及必要的运维凭据，
-  升级时复用原目录并使用已验证的同一镜像。
-  不要将 UI 导出的共享配置备份当成完整的灾难恢复备份。
-- 修改转发规则不需要重新 `docker run`。现有镜像没有“挂入规则文件后自动首次导入”的启动选项，
-  本文通过容器启动后的 API 初始化实现自动下发，不应在每次容器重启时重新覆盖配置。
+**文件没有热加载，也不是另一份声明式配置源。** manager 会将 UI/API 修改、缺省值、版本、
+publication 和运行状态保存回同一个文件。不要在容器运行时与 UI 并发编辑文件，
+也不要用初始化脚本每次覆盖它。手工编辑后的运行效果以本机下一次进程启动为准。

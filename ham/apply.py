@@ -17,8 +17,8 @@ from .base import (ACME_SH, CERT_DIR, CROWDSEC_SPOE, DRY_RUN, ERROR_DIR, HAPROXY
 from .config import (CLUSTER_KEYS, config_hash, load_config, merged, save_config,
                      shared_objects, shared_parts, shared_snapshot)
 from .util import _by_id, cert_details, cert_path, parse_domains, run
-from .validate import check_setting_types
-from . import acme, auth, cluster, crowdsec, errorpages, haproxy, keepalived, notify, stats, sync, updates, vrrp, watchdog, wizard
+from .validate import check_file_config, check_setting_types
+from . import acme, auth, cluster, crowdsec, errorpages, haproxy, keepalived, notify, startup, stats, sync, updates, vrrp, watchdog, wizard
 
 # --------------------------------------------------------------------------
 
@@ -375,10 +375,14 @@ def api_validate():
     return jsonify({"ok": ok, "message": message})
 
 
-def do_apply(cfg=None, allow_push=True):
+def do_apply(cfg=None, allow_push=True, startup_apply=False):
     with _lock:
         cfg = cfg or load_config()
         result = {"ok": False, "local_ok": False, "cluster_ok": None, "steps": []}
+        if startup.busy() and not startup_apply:
+            message = "Startup configuration arbitration is in progress; retry shortly."
+            log.warning("apply refused: %s", message)
+            return dict(result, error=message)
 
         def failed(message):
             log.error("apply failed: %s", message)
@@ -387,6 +391,17 @@ def do_apply(cfg=None, allow_push=True):
             save_config(cfg)
             return result
 
+        if startup.ENABLED:
+            if cfg["_meta"].get("unreadable"):
+                message = "Cannot apply an unreadable config.json; repair it on the host."
+                log.error("apply refused: %s", message)
+                return dict(result, error=message)
+            try:
+                check_file_config(cfg)
+                vrrp.check_interface(cfg)
+            except ValueError as error:
+                return failed(str(error))
+
         placeholders = ensure_cert_files(cfg)
         if placeholders:
             result["steps"].append("created placeholder certificates: " + ", ".join(placeholders))
@@ -394,8 +409,11 @@ def do_apply(cfg=None, allow_push=True):
         # Checked against staged copies of the files it names, so a refused
         # configuration leaves nothing behind on disk.
         generation = uuid.uuid4().hex
-        rc, out, text = _haproxy_check(
-            cfg, text=haproxy.render_haproxy(cfg, generation=generation))
+        try:
+            rc, out, text = _haproxy_check(
+                cfg, text=haproxy.render_haproxy(cfg, generation=generation))
+        except (ValueError, TypeError, KeyError) as error:
+            return failed("Could not render HAProxy configuration: %s" % error)
         result["haproxy_check"] = out
         if rc == 127 and DRY_RUN:
             result["steps"].append("haproxy binary not found -- validation skipped")
@@ -413,7 +431,11 @@ def do_apply(cfg=None, allow_push=True):
         k = cfg["local"]["keepalived"]
         kstaging = None
         if vrrp.keepalived_wanted(cfg):
-            if vrrp.derive_unicast(cfg):
+            try:
+                changed = vrrp.derive_unicast(cfg)
+            except ValueError as error:
+                return failed(str(error))
+            if changed:
                 result["steps"].append(
                     "unicast peers refreshed from the node list: %s"
                     % ((k.get("unicast_peer") or "").replace("\n", ", ") or "none -- using multicast"))
@@ -520,11 +542,15 @@ def do_apply(cfg=None, allow_push=True):
                                 applied_fp=snapshot["fp"], applied_hash=config_hash(cfg))
             cfg["_meta"].pop("apply_error", None)
             result.update(applied_rev=snapshot["rev"], applied_fp=snapshot["fp"])
+            if startup.ENABLED:
+                cfg["_meta"]["setup_complete"] = True
         else:
             result["error"] = result.get("error") or "; ".join(result.get("warnings") or
                                        ["HAProxy did not load the new configuration."])
             cfg["_meta"]["apply_error"] = result["error"]
         save_config(cfg)
+        if result["local_ok"]:
+            startup.applied(cfg)
         result["ok"] = result["local_ok"]
 
     # The push talks to every other node over the network, and an unresponsive
@@ -562,6 +588,8 @@ def api_preview():
 
 @app.post("/api/apply")
 def api_apply():
+    if startup.busy():
+        return jsonify({"ok": False, "error": "Startup Apply is in progress; retry shortly."}), 409
     return jsonify(do_apply())
 
 
@@ -648,6 +676,7 @@ def api_status():
         "applied_rev": int(cfg["_meta"].get("applied_rev") or 0),
         "applied_fp": cfg["_meta"].get("applied_fp") or "",
         "apply_error": cfg["_meta"].get("apply_error") or "",
+        "startup": startup.status(),
         # One tag per collection, so a disagreement can name the part it is in.
         "config_parts": shared_parts(cfg),
         # And one per object, so a disagreement can name the object rather

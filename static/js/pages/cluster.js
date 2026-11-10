@@ -154,8 +154,8 @@ export function peersCard(peers,loc){
     peers.forEach(p=>{
       const tr=document.createElement("tr");
       tr.innerHTML="<td>"+esc(p.name)+"</td><td class=mono>"+esc(p.url)+byNameHint(p.url)+"</td>"+
-        "<td>"+(p.has_key?(p.is_own_key?'<span class="pill down">'+t("this node's own key")+'</span>'
-                                       :'<span class="pill up">'+t("set")+'</span>')+
+        "<td>"+(p.has_key?(p.is_self?'<span class="pill down">'+t("This node")+'</span>'
+                                    :'<span class="pill up">'+t("set")+'</span>')+
             '<div class=sub>'+t("fingerprint {fp}",{fp:"<span class=mono>"+esc(p.key_fp)+"</span>"})+"</div>"
                          :'<span class="pill down">'+t("missing")+'</span>')+"</td>"+
         "<td>"+(p.enabled===false?'<span class="pill off">'+t("no")+'</span>':t("yes"))+"</td>";

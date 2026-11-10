@@ -43,7 +43,7 @@ from ham.auth import bad_username, key_fingerprint, set_admin
 from ham.acme import _renew_loop
 from ham.updates import _update_loop
 from ham.watchdog import _watchdog_loop
-from ham import crowdsec, sync, traffic
+from ham import crowdsec, startup, sync, traffic
 
 
 def _cli(argv):
@@ -201,7 +201,8 @@ if __name__ == "__main__":
     # In its own thread, so a peer that is slow to answer cannot delay the
     # listener coming up: a node that is catching up should still be reachable
     # while it does.
-    threading.Thread(target=_catch_up_at_start, daemon=True).start()
+    threading.Thread(target=startup.run if startup.ENABLED else _catch_up_at_start,
+                     daemon=True).start()
     # The CrowdSec bouncer: put on this node if it is missing (a package
     # install cannot fetch it), and brought up when CrowdSec is on.
     threading.Thread(target=crowdsec.startup, daemon=True).start()

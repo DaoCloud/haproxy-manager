@@ -121,6 +121,12 @@ python3 tools/integration/lab.py test
 ```
 
 `test` 使用独立的临时集群，结束后自动清理，不修改正在手动体验的集群。
+还会执行真实部署脚本生成多 VIP 四层配置，验证不同 VIP 共用 443、同一 VIP 使用不同端口、
+B 首次同步，以及 HAProxy 无响应、节点停止时全部 VIP 的整体切换和节点离线重启。
+客户端直接按 VIP 校验 backend 的 IP SAN，确认代理透传原始 backend 证书，
+并且请求路径、重定向和 Cookie 保持不变。
+这部分测试需要宿主机具备 Bash 和 jq；OpenSSL 仅用于实验 backend 生成测试证书。
+手动 `up` 仍使用前述单 VIP TCP passthrough，不修改宿主机防火墙或业务网卡。
 
 体验结束后，删除手动实验环境：
 
