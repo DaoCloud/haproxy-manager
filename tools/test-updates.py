@@ -13,6 +13,7 @@ import os
 import pathlib
 import sys
 import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 os.environ.setdefault("HAM_DATA_DIR", tempfile.mkdtemp(prefix="ham-upd-"))
@@ -95,12 +96,16 @@ cfg = load_config()
 cfg["local"]["api_key"] = "upd-key"
 save_config(cfg)
 H = {"X-API-Key": "upd-key"}
+with patch.object(updates, "check_for_update") as check:
+    response = client.post("/api/version/check", headers=H)
+    ok(response.status_code == 403 and not response.get_json()["ok"] and not check.called,
+       "the public check API is disabled without running a check")
 served.update({"main": "1.94.2", "beta": "1.95.0-beta.1"})
 updates.VERSION = "1.94.2"          # what this node runs, for the offer arithmetic
 
 v = client.get("/api/version", headers=H).get_json()
 ok(v.get("beta") is False and v.get("beta_ref") == "beta", "betas are off to begin with, and the branch is named")
-client.post("/api/version/check", headers=H)
+updates.check_for_update()
 v = client.get("/api/version", headers=H).get_json()
 ok(v["latest"] == "1.94.2" and v["available"] is False and v["latest_ref"] == "main",
    "a check with betas off finds the release: %s" % v["latest"])
@@ -108,7 +113,7 @@ ok(v["latest"] == "1.94.2" and v["available"] is False and v["latest_ref"] == "m
 r = client.put("/api/local", headers=H, json={"updates": {"beta": True}})
 ok(r.status_code == 200 and r.get_json()["updates"]["beta"] is True, "the setting is saved")
 ok(client.get("/api/local", headers=H).get_json()["updates"]["beta"] is True, "and read back")
-client.post("/api/version/check", headers=H)
+updates.check_for_update()
 v = client.get("/api/version", headers=H).get_json()
 ok(v["latest"] == "1.95.0-beta.1" and v["available"] is True and v["latest_is_beta"] is True
    and v["latest_ref"] == "beta", "with betas on the beta is offered, marked, with its branch")
@@ -135,7 +140,7 @@ ok("releases/download/v2.0.0-beta.8/haproxy-manager_2.0.0.beta.8_all.deb" in sh 
    "a deb node fetches the release's package and installs it with apt, and says so when there is none")
 ok("dnf install" in updates._package_shell("2.0.0", "rpm"), "an rpm node with dnf")
 client.put("/api/local", headers=H, json={"updates": {"beta": True}})
-client.post("/api/version/check", headers=H)
+updates.check_for_update()
 c = load_config()
 ok(updates._package_version(None, c) == "1.95.0-beta.1" and updates._package_version("beta", c) == "1.95.0-beta.1",
    "the version a package node installs is what the check found, for the ref on offer")

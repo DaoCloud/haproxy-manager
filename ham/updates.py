@@ -254,8 +254,7 @@ def api_version():
 
 @app.post("/api/version/check")
 def api_version_check():
-    info = check_for_update()
-    return jsonify(dict(info, version=VERSION))
+    return jsonify({"ok": False, "error": "New-version checks are disabled."}), 403
 
 
 def _update_running():

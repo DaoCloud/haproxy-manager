@@ -3,7 +3,7 @@ name: Build and publish the container image
 # Publishes multi-architecture images to the GitHub Container Registry.
 #
 #   ghcr.io/<owner>/haproxy-manager:latest     the default branch or a stable release
-#   ghcr.io/<owner>/haproxy-manager:1.46       the contents of VERSION
+#   ghcr.io/<owner>/haproxy-manager:V1.0.0     the exact Git tag, including case
 #   ghcr.io/<owner>/haproxy-manager:sha-abc123 one exact commit
 #   ghcr.io/<owner>/haproxy-manager:release-* the corresponding release tag
 #
@@ -11,21 +11,13 @@ name: Build and publish the container image
 # needs no self-hosted runner. Nothing here needs a secret: GITHUB_TOKEN can
 # write to the registry once `packages: write` is granted below.
 #
-# The image is also rebuilt once a week whether or not anything was pushed, and
-# that build ignores the layer cache. The image carries Debian, HAProxy,
-# Keepalived and acme.sh, and all but acme.sh are installed by one apt-get
-# layer whose text never changes -- so a cached build would keep serving the
-# packages of the day the cache was made, security updates included. The
-# weekly build publishes the same tags with fresh packages underneath, exactly
-# as the official library images do. Pull again to pick it up.
-#
 # A pull request that touches the image builds it for amd64 (without
 # publishing) and starts it, so a version bump is proven before it is merged.
 
 on:
   push:
     branches: [main]
-    tags: ['v*', 'release**']
+    tags: ['v*', 'V*', 'release**']
     # Documentation-only commits do not change the image.
     paths-ignore:
       - '**.md'
@@ -34,8 +26,6 @@ on:
       - Dockerfile
       - 'docker/**'
       - .github/workflows/docker-publish.yml
-  schedule:
-    - cron: '23 5 * * 1'      # Mondays, 05:23 UTC: fresh Debian and HAProxy packages
   workflow_dispatch:
 
 env:
@@ -50,6 +40,7 @@ jobs:
       packages: write
     outputs:
       version: ${{ steps.version.outputs.value }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
 
     steps:
       - name: Check out
@@ -61,13 +52,42 @@ jobs:
         run: |
           echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
-      - name: Read the version
+      - name: Resolve the Git version
         id: version
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          set -eu
+          sha=$(git rev-parse --short=7 HEAD)
+          revision=$(git rev-parse HEAD)
+          value="sha-$sha"
+          latest=false
+          prerelease=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] ||
+             { [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; }; then
+            latest=true
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            value="${GITHUB_REF#refs/tags/}"
+            if [[ ! "$value" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "Git tag cannot be used unchanged as a Docker tag: $value" >&2
+              exit 1
+            fi
+            number="${value#release}"
+            number="${number#[-_]}"
+            number="${number#[vV]}"
+            if [[ "$number" == *-* ]]; then
+              prerelease=true
+            else
+              latest=true
+            fi
+          fi
           {
-            echo "value=$(tr -d ' \n' < VERSION)"
-            echo "sha=$(git rev-parse --short=7 HEAD)"
-            echo "revision=$(git rev-parse HEAD)"
+            echo "value=$value"
+            echo "sha=$sha"
+            echo "revision=$revision"
+            echo "latest=$latest"
+            echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
@@ -97,17 +117,11 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            # "latest" is the default branch: a build there, a manual or weekly
-            # rebuild of it, or a release tag on a version without a
-            # prerelease mark. A beta's tag build must not move it -- it did
-            # once, and a pull of the plain image name got the beta.
-            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && !contains(steps.version.outputs.value, '-')) }}
-            # Always tag with VERSION, on a branch build and a tag build alike,
-            # so `docker pull …:1.48.0` works whichever triggered it and the
-            # image tag matches the file the app reports.
+            # Git tag builds keep the exact name. Other builds use sha-<commit>.
+            # Only stable tags, default-branch pushes and manual builds move latest.
+            type=raw,value=latest,enable=${{ steps.version.outputs.latest == 'true' }}
             type=raw,value=${{ steps.version.outputs.value }}
-            type=ref,event=tag,enable=${{ github.event_name == 'push' }}
-            type=raw,value=sha-${{ steps.version.outputs.sha }}
+            type=raw,value=sha-${{ steps.version.outputs.sha }},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
           labels: |
             org.opencontainers.image.title=HAProxy Cluster Manager
             org.opencontainers.image.description=Web UI for HAProxy, Keepalived and acme.sh
@@ -116,8 +130,6 @@ jobs:
 
       # A pull request builds one architecture into the local daemon, so the
       # check below can start it; everything else builds both and publishes.
-      # The scheduled build starts from nothing: no layer cache, and a fresh
-      # pull of the base image.
       - name: Build and push
         id: build
         uses: docker/build-push-action@v6
@@ -127,7 +139,6 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
           pull: true
-          no-cache: ${{ github.event_name == 'schedule' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -189,7 +200,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
           set -eu
           if gh release view "$TAG" >/dev/null; then
@@ -197,7 +208,7 @@ jobs:
             exit 0
           fi
           args=(--verify-tag --title "$TAG" --generate-notes)
-          if [[ "$VERSION" == *-* ]]; then
+          if [ "$PRERELEASE" = true ]; then
             args+=(--prerelease --latest=false)
           else
             args+=(--latest)
