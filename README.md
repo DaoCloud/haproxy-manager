@@ -1,113 +1,84 @@
 <!-- docs-site:skip -->
 <img src="static/logo.svg" alt="HAProxy Cluster Manager" width="268" height="64">
-
-> **📖 Documentation: [ham.iothing.net/docs](https://ham.iothing.net/docs/)** — the complete guide: every feature, every setting, and why it works the way it does.
 <!-- /docs-site:skip -->
 
-A small self-hosted web UI to manage an **HAProxy** configuration, obtain
-**Let's Encrypt** certificates, and run a **cluster of any number of nodes with
-Keepalived** on a shared virtual IP — one node active, the rest ready to take
-over, with settings and certificates syncing across all of them. Since 2.0 it
-also keeps named **address lists**, lets a service carry its own **rules** and
-**error pages**, and can put a **CrowdSec** bouncer in front of every HTTP
-service.
+HAProxy Cluster Manager 是一个轻量的自托管管理工具，通过 Web UI 和 API 管理
+HAProxy，并使用 Keepalived 实现共享虚拟 IP（VIP）和节点故障切换。
 
-**No database to run — no PostgreSQL, no Redis, no message broker.** The whole
-configuration is one JSON file on disk, and a cluster keeps its nodes in step
-by syncing that file between them over HTTPS. There is no separate datastore to
-install, secure, tune, back up, or keep alive alongside the proxy — which is
-the point: the tool that manages your load balancer should not itself be a
-stack that needs managing. A backup is one file; moving to new hardware is
-copying it across.
+## 核心功能
 
-```bash
-# from a package: .deb and .rpm on every release (Debian, Ubuntu, RHEL, Fedora)
-sudo apt-get install -y ./haproxy-manager_2.1.0_all.deb
+- **服务管理**：配置 HTTP/HTTPS 服务与 TCP 转发规则，先保存草稿，再通过 Apply 应用。
+- **高可用集群**：节点间同步配置和证书，active 节点持有 VIP，故障时由其他节点接管。
+- **证书管理**：申请和自动续期 Let's Encrypt 证书，也支持 TLS passthrough，由 backend 持有证书并终止 TLS。
+- **无需数据库**：配置保存在本地 JSON 文件中，不依赖 PostgreSQL、Redis 或消息中间件。
 
-# or the install script, on any Debian-based server
-curl -fsSL https://raw.githubusercontent.com/avandeputte/haproxy-manager/main/install.sh | sudo bash
+更多功能说明可参考[上游项目文档](https://ham.iothing.net/docs/)。
 
-# or in Docker (linux/amd64 and linux/arm64)
-docker run -d --network host --cap-add NET_ADMIN --cap-add NET_BROADCAST --cap-add NET_RAW \
-  -v ham-data:/var/lib/haproxy-manager -v ham-acme:/var/lib/acme.sh \
-  -v ham-haproxy:/etc/haproxy -v ham-keepalived:/etc/keepalived \
-  ghcr.io/avandeputte/haproxy-manager:latest
+## 双节点生产部署
 
-# or as a Proxmox VE LXC, from the Proxmox host (community-scripts engine)
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/avandeputte/haproxy-manager/main/proxmox/ct/haproxy-manager.sh)"
-```
+在两台独立的 Linux 主机上各运行一个包含 manager、HAProxy 和 Keepalived 的容器，
+使用宿主机网络，共用实际业务网络中的 VIP。
 
-Then open `http://<node>:8080`.
+按[双节点生产部署：Docker 与 API 初始化](docs/deploy-two-nodes-docker.md)完成
+镜像准备、容器启动、VIP 初始化、API 规则下发、应用确认和业务访问验证。
+直接使用本仓库发布的 `ghcr.io/daocloud/haproxy-manager:latest` 镜像，
+两节点应使用相同的仓库 digest。
 
-<img src="https://ham.iothing.net/docs/img/overview.png" alt="The Overview page: three nodes, their roles and versions, and every published service with a day of traffic" width="900">
+部署前确认两节点具备 rootful Docker，网络允许 VIP 漂移、ARP 更新和
+**IP 协议 112（VRRP，不是 TCP/UDP 端口 112）** 双向通信。
+管理端口 8080 仅允许节点和授权管理主机访问，不要暴露到公网。
+指南中的 HTTP 管理 API 仅适用于隔离、可信的网络，跨不可信网络时必须使用经过认证的加密通道。
 
-<sub>Every screenshot here is the real application, driven by a browser against
-a three-node cluster holding made-up data — see
-[tools/screenshots](tools/screenshots/).</sub>
+容器健康检查只报告 manager 是否响应，不能自动重启卡死的 manager，
+生产环境需要额外的监测和恢复机制。VIP 故障切换不保证已有 TCP 会话不中断。
 
-<!-- docs-site:skip -->
-This README is the install guide. Everything else — publishing services, certificates,
-clustering, sign-in, notifications, Home Assistant, Prometheus, the watchdog, and how it
-all works — is at **[ham.iothing.net/docs](https://ham.iothing.net/docs/)**, whose source is the
-[HAProxyManagerDocs](https://github.com/avandeputte/HAProxyManagerDocs) repository, where it is
-still checked against this code.
-<!-- /docs-site:skip -->
+## 本地双节点实验环境
 
-## Install
-
-Debian-based distributions (Debian 12/13, Ubuntu 22.04/24.04), on **every** node:
+在一台 Linux 宿主机上准备 rootful Docker、Docker Compose v2、Python 3 和 `iproute2`，
+当前用户需要有访问 Docker 的权限。在项目根目录执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/avandeputte/haproxy-manager/main/install.sh | sudo bash
+python3 tools/integration/lab.py up
 ```
 
-From a checkout, `sudo ./install.sh` installs those files instead of
-downloading. If HAProxy Cluster Manager is already installed the same command detects
-it and offers to **update**, **remove** (keeping `config.json` and
-certificates), **purge** (removing those too), or cancel; piped from `curl`
-with no terminal to ask on, it updates in place and says so.
+脚本会构建当前工作区的代码，启动两个代理节点和一个 HTTP/HTTPS backend，
+并配置 VIP 和两条 TCP 转发规则。HTTPS 使用 TLS passthrough，自签名证书的私钥只由 backend 持有。
+终端会打印 UI 地址、演示登录信息、VIP 和 backend 地址。重复执行 `up` 会保留已有配置。
 
-It installs `haproxy`, `keepalived`, `python3-flask`, `python3-requests`,
-`python3-waitress`, `openssl`, `socat` and `iproute2` from apt, a pinned
-[`acme.sh`](https://github.com/acmesh-official/acme.sh) with no cron of its own
-(the manager drives renewals), enables `net.ipv4.ip_nonlocal_bind` so HAProxy
-can bind a VIP this node does not hold, creates the administrator and API key,
-and installs the systemd unit. It also adds one third-party apt source —
-CrowdSec's repository, its signing key checked against a pinned fingerprint —
-for the SPOA bouncer, left stopped until CrowdSec is switched on;
-`--without-crowdsec` leaves that out.
+默认 UI 地址为 `http://127.0.0.1:18081` 和 `http://127.0.0.1:18082`，
+登录账号为 `admin`，密码为 `lab-demo-password`。演示账号仅用于实验，不适合生产环境。
 
-Nothing in HAProxy's configuration is touched until you press Apply. The first
-Apply overwrites `/etc/haproxy/haproxy.cfg`, keeping a `.bak`.
-
-**→ [Full installation guide](https://ham.iothing.net/docs/install-standalone/)** — every option, what
-happens in what order, where each file lives, updating, uninstalling and
-troubleshooting.
-
-## Docker
-
-Multi-architecture images (**linux/amd64** and **linux/arm64**) are published to
-the GitHub Container Registry:
+远程访问优先使用 SSH 端口转发。也可以设置实验启动脚本的环境变量
+`HAM_LAB_UI_BIND=0.0.0.0`，让 Docker 将 UI 端口映射到宿主机的全部 IPv4 接口：
 
 ```bash
-docker pull ghcr.io/avandeputte/haproxy-manager:latest   # or :1.46 to pin
-docker compose up -d                                     # on every node
+HAM_LAB_UI_BIND=0.0.0.0 python3 tools/integration/lab.py up
 ```
 
-The image is all-in-one: the manager, HAProxy, Keepalived and `acme.sh` in one
-container. There is no systemd inside a container, so `supervisord` runs the
-processes and a small `systemctl` shim ([docker/systemctl](docker/systemctl))
-translates the calls the app makes. HAProxy runs in master-worker mode and is
-reloaded with `SIGUSR2`, so Apply does not drop established connections.
+然后打开 `http://<宿主机 IP>:18081` 或 `http://<宿主机 IP>:18082`。
+**只应在可信网络中这样使用**，因为演示账号是公开的，且 UI 使用 HTTP。
+再次执行 `up` 时需保留同一个环境变量。
 
-Host networking is the intended mode — Keepalived's VRRP and the virtual IP need
-a real interface — and Keepalived needs `NET_ADMIN`, `NET_BROADCAST` and
-`NET_RAW`. One container per node.
+VIP 位于独立的 Docker bridge 网络中，不在宿主机的局域网上。
+检查转发时，在 Docker 宿主机的项目根目录执行：
 
-One thing a container cannot do: **restart a hung manager**. On a systemd host
-`WatchdogSec` handles that; supervisord only restarts a process that exits. The
-image's `HEALTHCHECK` reports it, but something has to act on that. For a
-production cluster, the native install is the better fit.
+```bash
+python3 tools/integration/lab.py check          # 检查真实 HTTP、TLS 转发和已应用版本
+python3 tools/integration/lab.py status
+```
 
-**→ [Full Docker guide](https://ham.iothing.net/docs/install-docker/)** — images and tags, compose,
-networking modes, volumes, environment, health, logs, upgrading and limitations.
+体验故障切换时，先在 UI 中确认当前持有 VIP 的节点。以下以 `proxy-a` 为例：
+
+```bash
+python3 tools/integration/lab.py stop proxy-a
+# 观察另一节点接管 VIP，运行 check 确认转发恢复，再启动原节点
+python3 tools/integration/lab.py start proxy-a
+```
+
+体验结束后执行以下命令，**删除实验环境的容器、网络和数据卷，包括 UI 中保存的配置**：
+
+```bash
+python3 tools/integration/lab.py down
+```
+
+完整操作、curl 示例和端口、网段调整方法见[快速开始：双节点容器实验环境](docs/get-started-lab.md)。

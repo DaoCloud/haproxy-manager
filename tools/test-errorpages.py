@@ -15,6 +15,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 os.environ.setdefault("HAM_DATA_DIR", tempfile.mkdtemp(prefix="ham-pages-"))
@@ -170,7 +171,8 @@ apply._selfsigned_placeholder(CERT_DIR / "stand-in.pem", ["stand-in"])
 good, msg = apply.check_rendered(load_config())
 ok(on_disk() == [], "a settings check writes nothing for real: haproxy -c reads staged copies")
 ok(good, "and the check passes: " + msg.splitlines()[0])
-res = apply.do_apply(load_config(), allow_push=False)
+with patch.object(apply, "_haproxy_not_serving", return_value=""):
+    res = apply.do_apply(load_config(), allow_push=False)
 ok(res.get("ok") and on_disk() == ["closed-503.html", "closed-503.http"],
    "Apply writes them, after the check: %s" % ", ".join(res.get("steps", [])))
 r = client.delete("/api/haproxy/errorpages/" + own["id"], headers=H)

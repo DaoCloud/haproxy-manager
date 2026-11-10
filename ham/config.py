@@ -9,7 +9,7 @@ import os
 import shutil
 
 from .base import CONF_PATH, DATA_DIR, _lock, log
-from .util import rule_cond_ids
+from .util import _by_id, rule_cond_ids
 
 # --------------------------------------------------------------------------
 
@@ -355,21 +355,45 @@ def merged(cfg):
     """
     out = copy.deepcopy(cfg)
     loc = cfg.get("local") or {}
+    frontend_names = {}
+    frontend_rules = []
     for sec in LOCAL_SECTIONS:
         for coll, items in (loc.get(sec) or {}).items():
             if isinstance(items, list) and isinstance(out.get(sec, {}).get(coll), list):
+                if sec == "haproxy" and coll == "frontends":
+                    for item in items:
+                        shared = next((f for f in out[sec][coll]
+                                       if (f.get("mode") or "http") == (item.get("mode") or "http")
+                                       and bool(f.get("ssl_enabled")) == bool(item.get("ssl_enabled"))
+                                       and f.get("binds") == item.get("binds")), None)
+                        if shared is None:
+                            out[sec][coll].append(copy.deepcopy(item))
+                            continue
+                        frontend_names[item["name"]] = shared["name"]
+                        frontend_rules.append((shared, item.get("rules") or []))
+                        for key in ("rules", "certificates"):
+                            shared[key] = list(shared.get(key) or [])
+                            shared[key].extend(
+                                x for x in item.get(key) or [] if x not in shared[key])
+                    continue
                 have = {i.get("id") for i in out[sec][coll]}
                 out[sec][coll] = out[sec][coll] + [copy.deepcopy(i) for i in items
                                                    if i.get("id") not in have]
+    hp = out["haproxy"]
+    rules = _by_id(hp["rules"])
+    for fe, local_rules in frontend_rules:
+        for rid in local_rules:
+            if rid in rules:
+                fe["rules"] = _place_rule(hp, fe["rules"], rules[rid])
     for name, att in (loc.get("attach") or {}).items():
         for fe in out.get("haproxy", {}).get("frontends") or []:
-            if fe.get("name") != name:
+            if fe.get("name") != frontend_names.get(name, name):
                 continue
             for key in ("rules", "certificates"):
-                extra = [x for x in (att.get(key) or []) if x not in (fe.get(key) or [])]
+                extra = list(att.get(key) or [])
                 if not extra:
                     continue
-                have = list(fe.get(key) or [])
+                have = [x for x in fe.get(key) or [] if x not in extra]
                 for x in extra:
                     where = (att.get("at") or {}).get(x)
                     if where is None or where > len(have):
@@ -378,6 +402,36 @@ def merged(cfg):
                         have.insert(where, x)
                 fe[key] = have
     return out
+
+
+def _is_wildcard(hp, rule):
+    """Does this rule route by a wildcard host name?"""
+    conds = _by_id(hp["conditions"])
+    return any((conds.get(c) or {}).get("type") == "host_matches"
+               and any(v.startswith("*.") for v in (conds[c].get("value") or "").split())
+               for c in rule_cond_ids(rule))
+
+
+def _place_rule(hp, rule_ids, rule):
+    """Position a rule among a frontend's rules by how specific it is.
+
+    HAProxy takes the first matching use_backend, so a rule for
+    host + /api must come before the host-only rule it refines -- otherwise
+    the broader one swallows the traffic and the narrower one never fires.
+    For the same reason a named host comes before a wildcard that would
+    also match it: app.example.com before *.example.com.
+    """
+    rules = _by_id(hp["rules"])
+    ids = [r for r in rule_ids if r != rule["id"]]
+    mine = set(rule_cond_ids(rule))
+    wild = _is_wildcard(hp, rule)
+    for i, rid in enumerate(ids):
+        other = rules.get(rid)
+        if not other:
+            continue
+        if set(rule_cond_ids(other)) < mine or (not wild and _is_wildcard(hp, other)):
+            return ids[:i] + [rule["id"]] + ids[i:]
+    return ids + [rule["id"]]
 
 
 def move_to_local(cfg, ids):
@@ -455,7 +509,7 @@ def promote_local(cfg):
             for i in items:
                 if i.get("id") not in have:
                     dest.append(i)
-                moved.add(i.get("id"))
+                    moved.add(i.get("id"))
             loc[sec][coll] = []
     for name, att in list((loc.get("attach") or {}).items()):
         for fe in cfg.get("haproxy", {}).get("frontends") or []:
@@ -497,6 +551,14 @@ def _fp(value):
 def shared_fingerprint(cfg):
     """A short tag for the shared configuration. Equal tags mean agreement."""
     return _fp(shared_view(cfg))
+
+
+def shared_snapshot(cfg):
+    """Freeze a shared configuration, including a change not saved yet."""
+    meta = cfg["_meta"]
+    fp = shared_fingerprint(cfg)
+    rev = int(meta.get("shared_rev") or 0) + (fp != meta.get("shared_fp"))
+    return {"config": copy.deepcopy(shared_view(cfg)), "rev": rev, "fp": fp}
 
 
 def shared_objects(cfg, limit=20000):
@@ -710,6 +772,13 @@ def config_hash(cfg):
              "keepalived": cfg["local"]["keepalived"]}
     if "crowdsec" in cfg:
         parts["crowdsec"] = cfg["crowdsec"]
+    for sec in LOCAL_SECTIONS:
+        objects = {key: items for key, items in (cfg["local"].get(sec) or {}).items()
+                   if isinstance(items, list) and items}
+        if objects:
+            parts["local_" + sec] = objects
+    if cfg["local"].get("attach"):
+        parts["local_attach"] = cfg["local"]["attach"]
     payload = json.dumps(parts, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 

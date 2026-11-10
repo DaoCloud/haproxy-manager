@@ -234,7 +234,7 @@ def _rate_limit(be):
 PROXY_PROTOCOL = {"v1": "send-proxy", "v2": "send-proxy-v2"}
 
 
-def render_haproxy(cfg):
+def render_haproxy(cfg, generation=None):
     """What this node serves: the shared configuration plus its own objects.
 
     Merged here rather than by every caller, so nothing can render a
@@ -289,6 +289,9 @@ def render_haproxy(cfg):
     for ln in (st.get("custom_global") or "").splitlines():
         if ln.strip():
             A("    " + ln.strip())
+    if generation:
+        # A fresh worker must report this value, even when only a PEM changed.
+        A("    setenv HAM_APPLY_GENERATION " + generation)
     A("")
     A("defaults")
     A("    log global")

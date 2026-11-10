@@ -1,0 +1,75 @@
+name: PR tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Python test dependencies
+        run: python -m pip install flask requests waitress
+      - name: Run self-contained Python tests
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/ham-unit"
+          export TMPDIR="$RUNNER_TEMP/ham-unit"
+          for test in tools/test-*.py; do
+            # test-recipes needs a running node and is not a unit test.
+            if [ "$test" = tools/test-recipes.py ]; then
+              continue
+            fi
+            echo "::group::$test"
+            data="$TMPDIR/${test##*/}"
+            mkdir -p "$data"
+            HAM_DATA_DIR="$data" \
+            HAM_CERT_DIR="$data/certs" \
+            HAM_HAPROXY_CFG="$data/haproxy.cfg" \
+            HAM_KEEPALIVED_CFG="$data/keepalived.conf" \
+            HAM_ERROR_DIR="$data/error-pages" \
+            HAM_CROWDSEC_SPOE="$data/crowdsec.cfg" \
+              python "$test"
+            echo "::endgroup::"
+          done
+      - name: Check JavaScript modules and sync results
+        run: |
+          node tools/uitests/undefined-names.mjs
+          node tools/uitests/module-graph.mjs
+          node tools/uitests/sync-results.mjs
+
+  integration:
+    name: Dual-node integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: docker/setup-buildx-action@v3
+      - name: Test real HAProxy and Keepalived nodes
+        run: python tools/integration/lab.py test

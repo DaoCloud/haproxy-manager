@@ -1,10 +1,10 @@
 """Pushing the shared configuration to the other nodes, and receiving it."""
 
-from datetime import datetime, timezone
 from flask import jsonify
 from flask import request
 from urllib.parse import urlsplit
 import base64
+import copy
 import concurrent.futures
 import hashlib
 import os
@@ -14,24 +14,30 @@ import uuid
 
 from .base import (CERT_DIR, PEER_CONNECT_TIMEOUT, PEER_READ_TIMEOUT,
     PUSH_READ_TIMEOUT, _lock, _requests, app, log)
-from .config import DEFAULT_CONFIG, _merge_defaults, load_config, save_config, shared_fingerprint, shared_view
+from .config import (DEFAULT_CONFIG, _merge_defaults, load_config, save_config,
+                     shared_fingerprint, shared_snapshot)
+from .util import cert_path
 from . import apply, auth, cluster, peering, webui
 
 # --------------------------------------------------------------------------
 
 def shared_payload(cfg):
+    published = cfg["_meta"].get("published")
+    if not published:
+        raise ValueError("No published configuration. Apply on this node before syncing.")
     certs = {}
-    if CERT_DIR.exists():
-        for p in sorted(CERT_DIR.glob("*.pem")):
+    for cert in published["config"]["acme"]["certificates"]:
+        p = cert_path(cert)
+        if p.exists():
             certs[p.name] = base64.b64encode(p.read_bytes()).decode()
     return {
-        "config": shared_view(cfg),
+        "config": copy.deepcopy(published["config"]),
         "certs": certs,
         "source": socket.gethostname(),
         # Which revision of the shared configuration this is. The receiver
         # compares it with its own and refuses to move backwards.
-        "rev": int(cfg["_meta"].get("shared_rev") or 0),
-        "fp": cfg["_meta"].get("shared_fp") or "",
+        "rev": published["rev"],
+        "fp": published["fp"],
         "ts": time.time(),
     }
 
@@ -121,9 +127,26 @@ def push_to_peer(peer, payload):
             except Exception:
                 pass
             return out
-        return {"ok": True, "name": peer.get("name") or url, "peer": r.json()}
+        d = r.json()
+        if not isinstance(d, dict):
+            return {"ok": False, "name": peer.get("name") or url,
+                    "error": "The peer returned an invalid application acknowledgement."}
+        applied = d.get("applied") or {}
+        if d.get("ok") is not True:
+            return {"ok": False, "name": peer.get("name") or url, "peer": d,
+                    "error": d.get("error") or applied.get("error")
+                    or "; ".join(applied.get("warnings") or [])
+                    or "The peer did not apply the configuration."}
+        if d.get("applied_rev") != payload["rev"] or d.get("applied_fp") != payload["fp"]:
+            return {"ok": False, "name": peer.get("name") or url, "peer": d,
+                    "state": "unconfirmed",
+                    "error": "The peer did not confirm the requested applied revision and "
+                             "fingerprint. Upgrade it if it cannot report them."}
+        return {"ok": True, "name": peer.get("name") or url, "peer": d,
+                "applied_rev": d["applied_rev"], "applied_fp": d["applied_fp"]}
     except Exception as e:
         return {"ok": False, "name": peer.get("name") or url,
+                "state": "unconfirmed",
                 "error": peering.peer_error(e, url, PUSH_READ_TIMEOUT)}
 
 
@@ -170,7 +193,11 @@ def sync_push(cfg, only=None, include_peers=True, force=False):
     if not peers:
         return {"ok": False, "error": "no peers configured (Cluster > Other nodes)"}
 
-    base = shared_payload(cfg)
+    try:
+        base = shared_payload(cfg)
+    except ValueError as e:
+        log.warning("sync refused: %s", e)
+        return {"ok": False, "error": str(e)}
     if force:
         # Belt and braces: the revision has already been lifted above every
         # node's, so this only matters if one of them moved in between.
@@ -215,6 +242,10 @@ def make_newest(cfg):
     number afterwards. The content does not change, so the fingerprint does
     not either.
     """
+    published = cfg["_meta"].get("published") or {}
+    if not published or published.get("fp") != shared_fingerprint(cfg) or \
+            cfg["_meta"].get("applied_fp") != published.get("fp") or cfg["_meta"].get("apply_error"):
+        raise ValueError("Apply this node's configuration successfully before overwriting peers.")
     highest = int(cfg["_meta"].get("shared_rev") or 0)
     seen = []
     for peer in enabled_peers(cfg):
@@ -236,8 +267,13 @@ def make_newest(cfg):
                         peer.get("name") or url, e)
     with _lock:
         cur = load_config()
+        if shared_fingerprint(cur) != published["fp"] or cur["_meta"].get("apply_error"):
+            raise ValueError("The configuration changed while checking peers. Apply and try again.")
         cur["_meta"]["shared_fp"] = shared_fingerprint(cur)
+        highest = max(highest, int(cur["_meta"].get("shared_rev") or 0))
         cur["_meta"]["shared_rev"] = highest + 1
+        cur["_meta"]["published"]["rev"] = highest + 1
+        cur["_meta"]["applied_rev"] = highest + 1
         save_config(cur)
     log.info("overwriting: this node moves to revision %d, above %s",
              highest + 1, ", ".join("%s at %d" % x for x in seen) or "nothing reported")
@@ -245,15 +281,13 @@ def make_newest(cfg):
 
 
 def reconcile(cfg, nodes):
-    """Push to any node that is demonstrably behind this one.
+    """Catch up locally or push to nodes that are demonstrably behind.
 
-    Called from the watchdog with the health it has just collected, so no
-    extra queries and no queue of pending pushes to lose. A push that failed
-    is not remembered; the next round observes the same disagreement and tries
-    again, which is what makes it heal rather than merely retry.
+    Called from the watchdog with the health it has just collected. A failed
+    application is not queued; the next round observes the same disagreement
+    and tries again.
 
-    Only from the node that holds the virtual IP, so a cluster does not have
-    every node pushing at once. Standalone nodes have nowhere to push.
+    Only the node holding the virtual IP pushes, but either node can catch up.
     """
     if _requests is None or not enabled_peers(cfg):
         return []
@@ -261,19 +295,42 @@ def reconcile(cfg, nodes):
     # nodes in step by hand does not want a background thread deciding to.
     if not cfg["local"]["sync"].get("auto_sync"):
         return []
-    mine = int(cfg["_meta"].get("shared_rev") or 0)
+    published = cfg["_meta"].get("published") or {}
+    mine, fp = published.get("rev", 0), published.get("fp", "")
+    by_url = {(p.get("url") or "").rstrip("/"): p for p in enabled_peers(cfg)}
+    reachable = [n for n in nodes if not n.get("self") and n.get("reachable")
+                 and (n.get("url") or "").rstrip("/") in by_url]
+    unapplied = published and shared_fingerprint(cfg) == fp and (
+        cfg["_meta"].get("applied_rev") != mine or cfg["_meta"].get("applied_fp") != fp
+        or cfg["_meta"].get("apply_error"))
+    if any(int(n.get("published_rev") or 0) > mine or (
+            unapplied and n.get("published_rev") == mine and n.get("published_fp") == fp)
+           for n in reachable):
+        result = catch_up(cfg)
+        return [dict(result, name=socket.gethostname())] if result is not None else []
+    if not published:
+        return []
     role, _held = auth.node_role(cfg)
     if role == "passive":
         return []
-    by_url = {(p.get("url") or "").rstrip("/"): p for p in enabled_peers(cfg)}
     behind = []
     for n in nodes:
         if n.get("self") or not n.get("reachable"):
             continue
         peer = by_url.get((n.get("url") or "").rstrip("/"))
-        # Only when the node says a revision at all: an older release does not
-        # report one, and pushing at it every round would be a loop.
-        if peer and n.get("config_fp") and int(n.get("config_rev") or 0) < mine:
+        if not peer:
+            continue
+        if n.get("supports_apply_ack") is False:
+            continue
+        received = int(n.get("published_rev", n.get("config_rev")) or 0)
+        if received > mine or int(n.get("config_rev") or 0) > mine:
+            continue
+        if received == mine and n.get("published_fp") and n["published_fp"] != fp:
+            log.warning("not reconciling %s: conflicting fingerprints at revision %d",
+                        n.get("name"), mine)
+            continue
+        if received < mine or n.get("applied_rev") != mine or n.get("applied_fp") != fp \
+                or n.get("apply_error"):
             behind.append((peer, n))
     out = []
     for peer, n in behind:
@@ -287,17 +344,18 @@ def reconcile(cfg, nodes):
 
 
 def catch_up(cfg):
-    """At startup, take the configuration from a peer that has a newer one.
+    """Take a newer publication, or retry a matching but unapplied one.
 
     A node that has been reinstalled, or was off while the cluster moved on,
     would otherwise wait to be pushed to -- and if it is the node that holds
-    the virtual IP, nothing pushes to it at all. Asking is cheap and happens
-    once.
+    the virtual IP, nothing pushes to it at all. Used at startup and when the
+    watchdog observes a recoverable publication.
     """
     peers = enabled_peers(cfg)
     if _requests is None or not peers or not cfg["local"]["sync"].get("auto_sync"):
         return None
-    mine = int(cfg["_meta"].get("shared_rev") or 0)
+    published = cfg["_meta"].get("published") or {}
+    mine = int(published.get("rev") or 0)
     best, best_rev = None, mine
     for peer in peers:
         url = (peer.get("url") or "").rstrip("/")
@@ -312,8 +370,12 @@ def catch_up(cfg):
         except Exception as e:
             log.info("catching up: %s did not answer (%s)", peer.get("name"), e)
             continue
-        rev = int(st.get("config_rev") or 0)
-        if st.get("config_fp") and rev > best_rev:
+        rev = int(st.get("published_rev") or 0)
+        unapplied = rev == mine and st.get("published_fp") == published.get("fp") and (
+            cfg["_meta"].get("applied_rev") != rev or
+            cfg["_meta"].get("applied_fp") != st.get("published_fp") or
+            cfg["_meta"].get("apply_error"))
+        if st.get("published_fp") and (rev > best_rev or unapplied and best is None):
             best, best_rev = peer, rev
     if not best:
         return None
@@ -363,7 +425,10 @@ def api_sync_push():
         if _requests is None:
             return jsonify({"ok": False,
                             "error": "python3-requests is not installed on this node"})
-        cfg = make_newest(cfg)
+        try:
+            cfg = make_newest(cfg)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 409
     return jsonify(sync_push(cfg, only=body.get("peer"),
                              include_peers=bool(body.get("include_peers", True)),
                              force=bool(body.get("overwrite"))))
@@ -377,7 +442,10 @@ def api_sync_pull():
     """
     cfg = load_config()
     caller = (request.args.get("node_url") or "").strip().rstrip("/")
-    payload = shared_payload(cfg)
+    try:
+        payload = shared_payload(cfg)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
     payload["peers"] = mesh_for(cfg, {"id": None, "url": caller})
     payload["source"] = socket.gethostname()
     return jsonify(payload)
@@ -427,6 +495,11 @@ def _receive_locked(cfg, data, conf, source=None):
                      "%s, use Overwrite on the Cluster page."
                      % (socket.gethostname(), mine, theirs, socket.gethostname(),
                         socket.gethostname())}), 409
+    if theirs and theirs == mine and data.get("fp") and \
+            data["fp"] != shared_fingerprint(cfg) and not data.get("force"):
+        return jsonify({"ok": False, "conflict": True, "error":
+                        "Conflicting configurations at revision %d. Choose the correct node "
+                        "and use Overwrite explicitly." % mine}), 409
 
     # A straight replacement. This node's own objects are not in these sections
     # -- they live under local -- so there is nothing to rescue afterwards.
@@ -498,44 +571,59 @@ def _receive_locked(cfg, data, conf, source=None):
         if kept:
             cfg["local"]["sync"]["peers"] = kept
 
-    CERT_DIR.mkdir(parents=True, exist_ok=True)
-    for name, b64 in (data.get("certs") or {}).items():
-        if "/" in name or ".." in name or not name.endswith(".pem"):
-            continue
-        p = CERT_DIR / name
-        p.write_bytes(base64.b64decode(b64))
-        os.chmod(p, 0o600)
+    shared_names = {cert_path(c).name for c in cfg["acme"]["certificates"]}
+    local_names = {cert_path(c).name
+                   for c in (cfg["local"].get("acme") or {}).get("certificates") or []}
+    collisions = shared_names & local_names
+    if collisions:
+        return jsonify({"ok": False, "error":
+                        "Shared certificate filenames conflict with this node's local certificates: "
+                        + ", ".join(sorted(collisions))}), 422
+    certificates = {}
+    try:
+        for name, b64 in (data.get("certs") or {}).items():
+            if "/" in name or ".." in name or not name.endswith(".pem"):
+                raise ValueError("invalid certificate filename: %s" % name)
+            if name not in shared_names:
+                log.warning("ignored certificate %s from %s: not in the shared publication",
+                            name, source)
+                continue
+            certificates[name] = base64.b64decode(b64, validate=True)
+    except (ValueError, TypeError) as e:
+        return jsonify({"ok": False, "error": "Invalid certificate payload: %s" % e}), 400
     # The listener this node's UI hangs off may have been replaced wholesale by
     # the incoming configuration. Rebuilding is idempotent and re-attaches it.
     if (cfg["local"].get("web_ui") or {}).get("enabled"):
         try:
             webui.rebuild_webui(cfg)
-        except Exception:
-            pass
+        except Exception as e:
+            log.exception("could not rebuild this node's management UI")
+            return jsonify({"ok": False, "error": "Could not rebuild this node's UI: %s" % e}), 400
     # Take the sender's place in the sequence rather than counting this as a
     # change of our own, so the sender and this node end up on the same
     # revision.
     cfg["_meta"]["shared_fp"] = shared_fingerprint(cfg)
     cfg["_meta"]["shared_rev"] = theirs
-    # Every node hashes the same thing -- the view that was sent -- so taking a
-    # configuration and then not matching it means something node-specific is
-    # sitting inside the shared sections without being marked as node-local.
-    # That is the one failure this whole mechanism cannot see past, so it is
-    # recorded and reported rather than left in a log nobody reads: the nodes
-    # would otherwise be shown as disagreeing forever with no reason given.
     if data.get("fp") and cfg["_meta"]["shared_fp"] != data["fp"]:
-        cfg["_meta"]["config_leak"] = {
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "source": source, "mine": cfg["_meta"]["shared_fp"], "theirs": data["fp"]}
-        log.warning("took the configuration from %s but computed a different "
-                    "fingerprint (%s here, %s there): something node-specific is "
-                    "inside the shared configuration", source,
-                    cfg["_meta"]["shared_fp"], data["fp"])
-    else:
-        cfg["_meta"].pop("config_leak", None)
+        return jsonify({"ok": False, "error":
+                        "The received configuration does not match its fingerprint."}), 422
+    ok, message = apply.check_rendered(cfg, certificates=certificates)
+    if not ok:
+        log.warning("refused invalid configuration from %s: %s", source, message)
+        return jsonify({"ok": False, "error": message}), 422
+    cfg["_meta"].pop("config_leak", None)
+    cfg["_meta"]["published"] = shared_snapshot(cfg)
+    CERT_DIR.mkdir(parents=True, exist_ok=True)
+    for name, content in certificates.items():
+        p = CERT_DIR / name
+        p.write_bytes(content)
+        os.chmod(p, 0o600)
     save_config(cfg)
     cluster.invalidate()
     log.info("received configuration from %s at revision %d",
              source, cfg["_meta"]["shared_rev"])
     res = apply.do_apply(cfg, allow_push=False)  # never re-push: avoids sync loops
-    return jsonify({"ok": res.get("ok", False), "node": socket.gethostname(), "applied": res})
+    return jsonify({"ok": res.get("local_ok", False), "node": socket.gethostname(),
+                    "error": res.get("error"), "applied": res,
+                    "applied_rev": cfg["_meta"].get("applied_rev"),
+                    "applied_fp": cfg["_meta"].get("applied_fp")})

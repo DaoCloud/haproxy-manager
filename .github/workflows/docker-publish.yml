@@ -2,9 +2,10 @@ name: Build and publish the container image
 
 # Publishes multi-architecture images to the GitHub Container Registry.
 #
-#   ghcr.io/<owner>/haproxy-manager:latest     the tip of main
+#   ghcr.io/<owner>/haproxy-manager:latest     the default branch or a stable release
 #   ghcr.io/<owner>/haproxy-manager:1.46       the contents of VERSION
 #   ghcr.io/<owner>/haproxy-manager:sha-abc123 one exact commit
+#   ghcr.io/<owner>/haproxy-manager:release-* the corresponding release tag
 #
 # amd64 builds natively; arm64 builds under QEMU emulation, which is slower but
 # needs no self-hosted runner. Nothing here needs a secret: GITHUB_TOKEN can
@@ -24,7 +25,7 @@ name: Build and publish the container image
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v*', 'release**']
     # Documentation-only commits do not change the image.
     paths-ignore:
       - '**.md'
@@ -39,22 +40,35 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
 
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.ref }}
+
+      - name: Set the image name
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Read the version
         id: version
-        run: echo "value=$(tr -d ' \n' < VERSION)" >> "$GITHUB_OUTPUT"
+        run: |
+          {
+            echo "value=$(tr -d ' \n' < VERSION)"
+            echo "sha=$(git rev-parse --short=7 HEAD)"
+            echo "revision=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         if: github.event_name != 'pull_request'
@@ -83,27 +97,29 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            # "latest" is the tip of main: a branch build there, the weekly
+            # "latest" is the default branch: a build there, a manual or weekly
             # rebuild of it, or a release tag on a version without a
             # prerelease mark. A beta's tag build must not move it -- it did
             # once, and a pull of the plain image name got the beta.
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/') && !contains(steps.version.outputs.value, '-')) }}
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && !contains(steps.version.outputs.value, '-')) }}
             # Always tag with VERSION, on a branch build and a tag build alike,
             # so `docker pull …:1.48.0` works whichever triggered it and the
             # image tag matches the file the app reports.
             type=raw,value=${{ steps.version.outputs.value }}
-            type=ref,event=tag
-            type=sha,prefix=sha-
+            type=ref,event=tag,enable=${{ github.event_name == 'push' }}
+            type=raw,value=sha-${{ steps.version.outputs.sha }}
           labels: |
             org.opencontainers.image.title=HAProxy Cluster Manager
             org.opencontainers.image.description=Web UI for HAProxy, Keepalived and acme.sh
             org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
 
       # A pull request builds one architecture into the local daemon, so the
       # check below can start it; everything else builds both and publishes.
       # The scheduled build starts from nothing: no layer cache, and a fresh
       # pull of the base image.
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -125,15 +141,17 @@ jobs:
           set -eu
           if [ "${{ github.event_name }}" = pull_request ]; then
             platforms=linux/amd64
+            image="${REGISTRY}/${IMAGE_NAME}:${{ steps.version.outputs.value }}"
           else
             platforms="linux/amd64 linux/arm64"
+            image="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
           fi
           echo "## Image contents" >> "$GITHUB_STEP_SUMMARY"
           for platform in $platforms; do
             echo "== $platform =="
             docker run -d --name check --platform "$platform" \
               -e HAM_ADMIN_PASSWORD=checkonly \
-              "${REGISTRY}/${IMAGE_NAME}:${{ steps.version.outputs.value }}"
+              "$image"
             for i in $(seq 60); do
               if docker exec check curl -fsS http://127.0.0.1:8080/api/whoami >/dev/null 2>&1; then
                 echo "   the UI answered"
@@ -157,3 +175,31 @@ jobs:
             } | tee -a "$GITHUB_STEP_SUMMARY"
             docker rm -f check >/dev/null
           done
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null; then
+            echo "Release $TAG already exists."
+            exit 0
+          fi
+          args=(--verify-tag --title "$TAG" --generate-notes)
+          if [[ "$VERSION" == *-* ]]; then
+            args+=(--prerelease --latest=false)
+          else
+            args+=(--latest)
+          fi
+          gh release create "$TAG" "${args[@]}"

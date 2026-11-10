@@ -26,7 +26,8 @@ os.environ["HAM_DRY_RUN"] = "1"
 
 import ham; ham   # noqa: E402  (route registration)
 from ham import apply, cluster, history, peering, probe, traffic   # noqa: E402
-from ham.config import HISTORY_KEEP, load_config, save_config, shared_objects   # noqa: E402
+from ham.config import (HISTORY_KEEP, load_config, save_config,
+                        shared_objects, shared_snapshot)   # noqa: E402
 
 fails = []
 
@@ -150,6 +151,8 @@ cfg = load_config()
 cfg["local"]["sync"]["peers"] = [
     {"id": "p2", "name": "node2", "url": "https://10.9.9.2:8080", "api_key": "x", "enabled": True},
     {"id": "p3", "name": "node3", "url": "https://10.9.9.3:8080", "api_key": "x", "enabled": True}]
+published = shared_snapshot(cfg)
+cfg["_meta"].update(published=published, applied_rev=published["rev"], applied_fp=published["fp"])
 save_config(cfg)
 me = client.get("/api/status?brief=1", headers=H).get_json()
 my_fp, my_rev = me["config_fp"], me["config_rev"]
@@ -163,6 +166,8 @@ def fake_query(peer, timeout=None, brief=False):
             "version": "1.100.2", "role": "passive", "haproxy": "active",
             "keepalived": "disabled", "vips": [], "vip_held": [], "dirty": False,
             "config_rev": my_rev, "config_fp": fps[peer["id"]], "config_parts": {},
+            "published_rev": my_rev, "published_fp": fps[peer["id"]],
+            "applied_rev": my_rev, "applied_fp": fps[peer["id"]], "apply_error": "",
             "config_objects": {} if brief else {"haproxy.backends": [["b", "b", "ffff"]]},
             "brief": brief, "config_objects_capped": False, "config_leak": None,
             "update_available": False, "certs_total": 0, "certs_bad": 0}

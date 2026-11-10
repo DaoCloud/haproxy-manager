@@ -47,9 +47,20 @@ def build_webui(cfg, pub, mode="auto", http_redirect=True):
     every time, and a node would gain another copy of its own UI service on
     every configuration it received.
     """
-    promote_local(cfg)
+    frontends = copy.deepcopy(cfg["haproxy"]["frontends"])
+    certificates = copy.deepcopy(cfg["acme"]["certificates"])
+    shared_certs = {c["id"] for c in certificates}
+    shared = {f["id"]: f for f in frontends}
+    mine = promote_local(cfg)
+    pubs = webui_pubs(cfg, pub)
+    # The wizard may extend a reused certificate. Only node-local ones may
+    # change while rebuilding this node's UI.
+    cfg["acme"]["certificates"] = [
+        c for c in cfg["acme"]["certificates"]
+        if c["id"] not in shared_certs
+        or all(wizard.cert_for_host([c], p["host"])[0] for p in pubs)]
     target = {"scheme": "http", "host": "127.0.0.1", "port": PORT, "path": "", "label": WEBUI_NAME}
-    acts, warns = dnsapi.wizard_publish(cfg, webui_pubs(cfg, pub), [target], name=WEBUI_NAME,
+    acts, warns = dnsapi.wizard_publish(cfg, pubs, [target], name=WEBUI_NAME,
                                  want_cert=(mode != "none"), new_certificate=(mode == "new"),
                                  http_redirect=http_redirect,
                                  health={"type": "http", "interval": "5s", "uri": "/", "status": "200"})
@@ -58,9 +69,21 @@ def build_webui(cfg, pub, mode="auto", http_redirect=True):
     # it cannot travel to the other nodes because it is not in what is sent.
     # A certificate that merely covers this host and was reused -- a wildcard --
     # was not built here and stays shared.
-    mine = webui_object_ids(cfg)
+    mine |= webui_object_ids(cfg)
     mine |= {c["id"] for c in cfg["acme"]["certificates"] if is_webui_cert(c)}
+    mine |= {f["id"] for f in cfg["haproxy"]["frontends"] if f["id"] not in shared}
     move_to_local(cfg, mine)
+    # Keep UI-only listeners and certificate additions on this node.
+    # merged() reuses a compatible shared bind instead of binding it twice.
+    for fe in cfg["haproxy"]["frontends"]:
+        before = shared[fe["id"]]
+        extra = {key: [x for x in fe.get(key) or [] if x not in (before.get(key) or [])]
+                 for key in ("rules", "certificates")}
+        if any(extra.values()):
+            cfg["local"]["haproxy"].setdefault("frontends", []).append(
+                dict(copy.deepcopy(fe), **extra))
+    cfg["haproxy"]["frontends"] = frontends
+    cfg["acme"]["certificates"] = certificates
     # Record which rule this node uses, here rather than only in the request
     # handler: this also runs when a configuration arrives from another node,
     # and a stale id would make the rule actually in use look like a leftover.
@@ -193,10 +216,11 @@ def api_webui_tidy():
         extras = extra_ui_rules(cfg)
         if not extras:
             return jsonify({"ok": True, "removed": [], "note": "There was nothing to tidy."})
-        promote_local(cfg)                       # where _remove_service_objects looks
+        owned = promote_local(cfg)               # where _remove_service_objects looks
         removed = []
         for rule in extras:
             removed += _remove_service_objects(cfg["haproxy"], rule["id"])
+        move_to_local(cfg, owned)
         s = cfg["local"].get("web_ui") or {}
         pub, err = wizard._split_url(s.get("url"), "x", default_scheme="https",
                                      allow=("http", "https"))
@@ -302,8 +326,9 @@ def api_webui_set():
             removed = []
             rid = s.get("rule_id")
             if rid:
-                promote_local(cfg)      # where _remove_service_objects looks
+                owned = promote_local(cfg)      # where _remove_service_objects looks
                 removed = _remove_service_objects(cfg["haproxy"], rid)
+                move_to_local(cfg, owned)
             s.update({"enabled": False, "rule_id": ""})
             save_config(cfg)
             return jsonify({"ok": True, "enabled": False, "removed": removed,

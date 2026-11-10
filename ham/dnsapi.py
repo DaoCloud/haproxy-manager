@@ -11,7 +11,7 @@ import shutil
 import uuid
 
 from .base import ACME_HOME, ACME_SH, _lock, app
-from .config import load_config, save_config
+from .config import _place_rule, load_config, save_config
 from .util import _by_id, _sec, cert_details, cert_path, parse_domains, rule_cond_ids, run
 from . import access, acme, errorpages, validate, wizard, oauth
 from .validate import plain_url as _plain_url
@@ -307,36 +307,6 @@ def _drop_orphan_wizard_servers(hp, candidate_ids, acts):
         if srv and srv.get("description") == wizard.WIZARD_MARK:
             hp["servers"] = [s for s in hp["servers"] if s.get("id") != sid]
             acts.append({"action": "removed", "type": "Real Server", "name": srv.get("name")})
-
-
-def _is_wildcard(hp, rule):
-    """Does this rule route by a wildcard host name?"""
-    conds = _by_id(hp["conditions"])
-    return any((conds.get(c) or {}).get("type") == "host_matches"
-               and any(v.startswith("*.") for v in (conds[c].get("value") or "").split())
-               for c in rule_cond_ids(rule))
-
-
-def _place_rule(hp, rule_ids, rule):
-    """Position a rule among a frontend's rules by how specific it is.
-
-    HAProxy takes the first matching use_backend, so a rule for
-    host + /api must come before the host-only rule it refines -- otherwise
-    the broader one swallows the traffic and the narrower one never fires.
-    For the same reason a named host comes before a wildcard that would
-    also match it: app.example.com before *.example.com.
-    """
-    rules = _by_id(hp["rules"])
-    ids = [r for r in rule_ids if r != rule["id"]]
-    mine = set(rule_cond_ids(rule))
-    wild = _is_wildcard(hp, rule)
-    for i, rid in enumerate(ids):
-        other = rules.get(rid)
-        if not other:
-            continue
-        if set(rule_cond_ids(other)) < mine or (not wild and _is_wildcard(hp, other)):
-            return ids[:i] + [rule["id"]] + ids[i:]
-    return ids + [rule["id"]]
 
 
 def _label(host):

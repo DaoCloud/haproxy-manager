@@ -5,6 +5,13 @@
    an entry that drops one. Grouped by the module the string comes from; a
    string used in several places appears once, where it first turns up. */
 export default {
+"Applied on this node.": "Tillämpat på den här noden.",
+"No published configuration. Apply on this node before syncing.": "Ingen publicerad konfiguration. Tillämpa den på den här noden före synkronisering.",
+"The peer returned an invalid application acknowledgement.": "Den andra noden returnerade en ogiltig bekräftelse på tillämpningen.",
+"The peer did not confirm the requested applied revision and fingerprint. Upgrade it if it cannot report them.": "Den andra noden bekräftade inte den begärda tillämpade revisionen och fingeravtrycket. Uppgradera den om den inte kan rapportera dem.",
+"Apply this node's configuration successfully before overwriting peers.": "Tillämpa den här nodens konfiguration utan fel innan andra noder skrivs över.",
+"The configuration changed while checking peers. Apply and try again.": "Konfigurationen ändrades under kontrollen av andra noder. Tillämpa den och försök igen.",
+"The received configuration does not match its fingerprint.": "Den mottagna konfigurationen stämmer inte med sitt fingeravtryck.",
 
 /* ---- auth.js ---- */
 "Create an administrator": "Skapa en administratör",
@@ -1319,8 +1326,6 @@ export default {
 /* ---- shell.js ---- */
 "v{version} available": "v{version} tillgänglig",
 "Applying...": "Tillämpar…",
-"FAILED: {error}": "MISSLYCKADES: {error}",
-"HAProxy was applied, but something else needs attention:": "HAProxy tillämpades, men något annat behöver åtgärdas:",
 "haproxy -c output": "utdata från haproxy -c",
 "keepalived -t output": "utdata från keepalived -t",
 "Apply failed": "Tillämpa misslyckades",

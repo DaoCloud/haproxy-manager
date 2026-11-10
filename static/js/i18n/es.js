@@ -5,6 +5,13 @@
    an entry that drops one. Grouped by the module the string comes from; a
    string used in several places appears once, where it first turns up. */
 export default {
+"Applied on this node.": "Aplicado en este nodo.",
+"No published configuration. Apply on this node before syncing.": "No hay configuración publicada. Aplíquela en este nodo antes de sincronizar.",
+"The peer returned an invalid application acknowledgement.": "El otro nodo devolvió una confirmación de aplicación no válida.",
+"The peer did not confirm the requested applied revision and fingerprint. Upgrade it if it cannot report them.": "El otro nodo no confirmó la revisión aplicada y la huella solicitadas. Actualícelo si no puede notificarlas.",
+"Apply this node's configuration successfully before overwriting peers.": "Aplique correctamente la configuración de este nodo antes de sobrescribir otros nodos.",
+"The configuration changed while checking peers. Apply and try again.": "La configuración cambió mientras se comprobaban otros nodos. Aplíquela e inténtelo de nuevo.",
+"The received configuration does not match its fingerprint.": "La configuración recibida no coincide con su huella.",
 
 /* ---- auth.js ---- */
 "Create an administrator": "Crear un administrador",
@@ -1319,8 +1326,6 @@ export default {
 /* ---- shell.js ---- */
 "v{version} available": "v{version} disponible",
 "Applying...": "Aplicando…",
-"FAILED: {error}": "FALLO: {error}",
-"HAProxy was applied, but something else needs attention:": "HAProxy se ha aplicado, pero otra cosa necesita atención:",
 "haproxy -c output": "salida de haproxy -c",
 "keepalived -t output": "salida de keepalived -t",
 "Apply failed": "Aplicar falló",

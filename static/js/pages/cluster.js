@@ -333,7 +333,16 @@ export async function clusterCard(fresh){
                        ?'<span class="pill up">'+t("revision {rev}",{rev:esc(n.config_rev)})+"</span>"
                        :'<span class="pill warn">'+t("revision {rev}",{rev:esc(n.config_rev)})+'</span><div class=sub>'+
                         esc((n.config_fp||"").slice(0,8))+"</div>"))
-                 :'<span class=sub>'+t("not reported")+'</span>')+"</td>"+
+                 :'<span class=sub>'+t("not reported")+'</span>')+
+          (n.applied_rev!==undefined
+            ?'<div class=sub>'+pill(n.apply_error?"failed":
+              n.published_fp&&n.applied_fp===n.published_fp&&n.applied_rev===n.published_rev
+                ?"applied":"unapplied changes",
+              !!n.published_fp&&n.applied_fp===n.published_fp&&
+                n.applied_rev===n.published_rev&&!n.apply_error)+
+              " "+t("revision {rev}",{rev:esc(n.applied_rev??"?")})+"</div>"+
+              (n.apply_error?'<div class=sub>'+esc(n.apply_error)+"</div>":"")
+            :"")+"</td>"+
         "<td>"+(n.certs_total?(n.certs_bad?'<span class="pill warn">'+t("{bad} of {total} need attention",{bad:n.certs_bad,total:n.certs_total})+"</span>"
                                           :'<span class="pill up">'+t("{n} ok",{n:n.certs_total})+"</span>")
                              :'<span class=sub>'+t("none")+'</span>')+"</td>"+

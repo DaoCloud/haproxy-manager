@@ -5,6 +5,13 @@
    an entry that drops one. Grouped by the module the string comes from; a
    string used in several places appears once, where it first turns up. */
 export default {
+"Applied on this node.": "Otettu käyttöön tässä solmussa.",
+"No published configuration. Apply on this node before syncing.": "Ei julkaistua määritystä. Ota määritys käyttöön tässä solmussa ennen synkronointia.",
+"The peer returned an invalid application acknowledgement.": "Toinen solmu palautti virheellisen käyttöönoton vahvistuksen.",
+"The peer did not confirm the requested applied revision and fingerprint. Upgrade it if it cannot report them.": "Toinen solmu ei vahvistanut pyydettyä käyttöön otettua versiota ja sormenjälkeä. Päivitä solmu, jos se ei pysty ilmoittamaan niitä.",
+"Apply this node's configuration successfully before overwriting peers.": "Ota tämän solmun määritys onnistuneesti käyttöön ennen muiden solmujen korvaamista.",
+"The configuration changed while checking peers. Apply and try again.": "Määritys muuttui muiden solmujen tarkistuksen aikana. Ota se käyttöön ja yritä uudelleen.",
+"The received configuration does not match its fingerprint.": "Vastaanotettu määritys ei vastaa sormenjälkeään.",
 
 /* ---- auth.js ---- */
 "Create an administrator": "Luo ylläpitäjä",
@@ -1319,8 +1326,6 @@ export default {
 /* ---- shell.js ---- */
 "v{version} available": "v{version} saatavilla",
 "Applying...": "Otetaan käyttöön…",
-"FAILED: {error}": "EPÄONNISTUI: {error}",
-"HAProxy was applied, but something else needs attention:": "HAProxy otettiin käyttöön, mutta jokin muu vaatii huomiota:",
 "haproxy -c output": "haproxy -c -tuloste",
 "keepalived -t output": "keepalived -t -tuloste",
 "Apply failed": "Käyttöönotto epäonnistui",

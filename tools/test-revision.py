@@ -20,7 +20,7 @@ os.environ["HAM_DRY_RUN"] = "1"
 
 import ham; ham   # noqa: E402  (route registration)
 from ham.config import (load_config, save_config, shared_fingerprint,   # noqa: E402
-                        shared_view)
+                        shared_snapshot, shared_view)
 
 fails = []
 
@@ -120,8 +120,9 @@ ok(not deep_find(shared_view(cfg), SENTINEL),
 ok(deep_find(cfg, SENTINEL), "(the marker really is in the configuration)")
 
 from ham.sync import shared_payload   # noqa: E402
+cfg["_meta"]["published"] = shared_snapshot(cfg)
 ok(shared_payload(cfg)["config"] == shared_view(cfg),
-   "what is sent to the other nodes is exactly what is compared")
+   "the published snapshot carries exactly the shared view, without node-local values")
 
 a = stuff_locals(load_config(), "node-one")
 b = stuff_locals(load_config(), "node-two")

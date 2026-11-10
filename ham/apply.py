@@ -10,13 +10,15 @@ import shutil
 import socket
 import tempfile
 import time
+import uuid
 
-from .base import (ACME_SH, CERT_DIR, CROWDSEC_SPOE, ERROR_DIR, HAPROXY_CFG, KEEPALIVED_CFG,
+from .base import (ACME_SH, CERT_DIR, CROWDSEC_SPOE, DRY_RUN, ERROR_DIR, HAPROXY_CFG, KEEPALIVED_CFG,
     VERSION, _lock, _requests, app, log)
-from .config import CLUSTER_KEYS, config_hash, load_config, merged, save_config, shared_objects, shared_parts
+from .config import (CLUSTER_KEYS, config_hash, load_config, merged, save_config,
+                     shared_objects, shared_parts, shared_snapshot)
 from .util import _by_id, cert_details, cert_path, parse_domains, run
 from .validate import check_setting_types
-from . import acme, auth, cluster, crowdsec, errorpages, haproxy, keepalived, notify, sync, updates, vrrp, watchdog, wizard
+from . import acme, auth, cluster, crowdsec, errorpages, haproxy, keepalived, notify, stats, sync, updates, vrrp, watchdog, wizard
 
 # --------------------------------------------------------------------------
 
@@ -44,7 +46,7 @@ def _selfsigned_placeholder(path, names):
     return False
 
 
-def ensure_cert_files(cfg):
+def ensure_cert_files(cfg, directory=None):
     made = []
     cfg = merged(cfg)          # this node's own certificates need files too
     certs = _by_id(cfg["acme"]["certificates"])
@@ -56,9 +58,11 @@ def ensure_cert_files(cfg):
             if not c:
                 continue
             p = cert_path(c)
+            if directory is not None:
+                p = Path(directory) / p.name
             doms = parse_domains(c) or [c["name"]]
             if not p.exists():
-                CERT_DIR.mkdir(parents=True, exist_ok=True)
+                p.parent.mkdir(parents=True, exist_ok=True)
                 if _selfsigned_placeholder(p, doms):
                     made.append(p.name)
                 continue
@@ -123,23 +127,25 @@ def _haproxy_hint(output):
     return ""
 
 
-def _haproxy_not_serving():
-    """"" if HAProxy is answering, otherwise why it is not.
+def _haproxy_not_serving(generation=None):
+    """Empty if HAProxy is serving the expected generation, otherwise why not.
 
     Given a moment first: a reload is not instantaneous, and reporting a
     failure because the check was quicker than the restart would be worse than
     not checking at all.
     """
-    for _ in range(10):
+    for attempt in range(11):
         state, detail = watchdog.probe_haproxy(load_config())
         if state in ("ok", "idle"):
-            return ""
-        if state == "starting":
+            if not generation or DRY_RUN:
+                return ""
+            text, error = stats._socket_command("show env HAM_APPLY_GENERATION")
+            if not error and "HAM_APPLY_GENERATION=" + generation in (text or "").splitlines():
+                return ""
+            detail = error or "HAProxy has not confirmed the new configuration generation."
+        if attempt < 10:
             time.sleep(1)
-            continue
-        time.sleep(1)
-    state, detail = watchdog.probe_haproxy(load_config())
-    return "" if state in ("ok", "idle") else detail
+    return detail
 
 
 def _restore_previous_haproxy_cfg():
@@ -257,7 +263,7 @@ def api_keepalived_status():
     })
 
 
-def _staged(cfg, text, stage):
+def _staged(cfg, text, stage, certificates=None):
     """The rendered text, pointed at copies of the files it names, in `stage`.
 
     haproxy -c reads every errorfile and the SPOE engine, so a check of a
@@ -274,22 +280,34 @@ def _staged(cfg, text, stage):
     spoe = os.path.join(stage, "crowdsec.cfg")
     with open(spoe, "w") as f:
         f.write(crowdsec.SPOE)
+    if certificates is not None:
+        certs = Path(stage) / "certs"
+        certs.mkdir(mode=0o700)
+        if CERT_DIR.exists():
+            for path in CERT_DIR.glob("*.pem"):
+                shutil.copy2(path, certs / path.name)
+        for name, content in certificates.items():
+            path = certs / name
+            path.write_bytes(content)
+            os.chmod(path, 0o600)
+        ensure_cert_files(cfg, directory=certs)
+        text = text.replace(str(CERT_DIR) + "/", str(certs) + "/")
     return text.replace(str(ERROR_DIR) + "/", pages + "/").replace(str(CROWDSEC_SPOE), spoe)
 
 
-def _haproxy_check(cfg, text=None):
+def _haproxy_check(cfg, text=None, certificates=None):
     """haproxy -c over this configuration, against staged copies of its files:
     (rc, output, text). 127 means no haproxy here."""
     text = haproxy.render_haproxy(cfg) if text is None else text
     with tempfile.TemporaryDirectory(prefix="ham-check-") as stage:
         path = os.path.join(stage, "haproxy.cfg")
         with open(path, "w") as f:
-            f.write(_staged(cfg, text, stage))
+            f.write(_staged(cfg, text, stage, certificates))
         rc, out = run(["haproxy", "-c", "-f", path], timeout=30)
     return rc, out, text
 
 
-def check_rendered(cfg):
+def check_rendered(cfg, certificates=None):
     """Run haproxy -c and keepalived -t over what this configuration renders to.
 
     Returns (ok, message). Used before saving settings, so a directive that
@@ -298,8 +316,8 @@ def check_rendered(cfg):
     """
     problems = []
     try:
-        rc, out, _text = _haproxy_check(cfg)
-        if rc not in (0, 127):
+        rc, out, _text = _haproxy_check(cfg, certificates=certificates)
+        if rc != 0 and not (rc == 127 and DRY_RUN):
             problems.append("HAProxy rejected it:\n" + out.strip())
     except Exception as e:
         problems.append("could not render haproxy.cfg: %s" % e)
@@ -311,7 +329,7 @@ def check_rendered(cfg):
             with os.fdopen(fd, "w") as f:
                 f.write(keepalived.render_keepalived(cfg))
             rc, out = run(["keepalived", "-t", "-f", kstaging], timeout=30)
-            if rc not in (0, 127):
+            if rc != 0 and not (rc == 127 and DRY_RUN):
                 problems.append("Keepalived rejected it:\n" + out.strip())
         except Exception as e:
             problems.append("could not render keepalived.conf: %s" % e)
@@ -360,7 +378,14 @@ def api_validate():
 def do_apply(cfg=None, allow_push=True):
     with _lock:
         cfg = cfg or load_config()
-        result = {"ok": False, "steps": []}
+        result = {"ok": False, "local_ok": False, "cluster_ok": None, "steps": []}
+
+        def failed(message):
+            log.error("apply failed: %s", message)
+            result["error"] = message
+            cfg["_meta"]["apply_error"] = message
+            save_config(cfg)
+            return result
 
         placeholders = ensure_cert_files(cfg)
         if placeholders:
@@ -368,9 +393,11 @@ def do_apply(cfg=None, allow_push=True):
 
         # Checked against staged copies of the files it names, so a refused
         # configuration leaves nothing behind on disk.
-        rc, out, text = _haproxy_check(cfg)
+        generation = uuid.uuid4().hex
+        rc, out, text = _haproxy_check(
+            cfg, text=haproxy.render_haproxy(cfg, generation=generation))
         result["haproxy_check"] = out
-        if rc == 127:
+        if rc == 127 and DRY_RUN:
             result["steps"].append("haproxy binary not found -- validation skipped")
         elif rc != 0:
             result["error"] = ("HAProxy configuration failed validation. Nothing was "
@@ -381,7 +408,26 @@ def do_apply(cfg=None, allow_push=True):
                    "The generated HAProxy configuration did not validate, so nothing was "
                    "changed and the running configuration is untouched.\n\n%s"
                    % watchdog._why_rejected(out), "error", cfg)
-            return result
+            return failed(result["error"])
+
+        k = cfg["local"]["keepalived"]
+        kstaging = None
+        if vrrp.keepalived_wanted(cfg):
+            if vrrp.derive_unicast(cfg):
+                result["steps"].append(
+                    "unicast peers refreshed from the node list: %s"
+                    % ((k.get("unicast_peer") or "").replace("\n", ", ") or "none -- using multicast"))
+            if not keepalived.write_track_script():
+                return failed("Could not write the Keepalived tracking script.")
+            fd, kstaging = tempfile.mkstemp(suffix=".conf")
+            with os.fdopen(fd, "w") as f:
+                f.write(keepalived.render_keepalived(cfg))
+            rc, out = run(["keepalived", "-t", "-f", kstaging])
+            if rc != 0 and not (rc == 127 and DRY_RUN):
+                os.unlink(kstaging)
+                result["keepalived_check"] = out
+                return failed("Keepalived configuration was rejected. "
+                              + _keepalived_hint(out, k))
 
         # It passed: now the real files, then the services. The pages and the
         # engine first, since the file about to be installed names them; the
@@ -419,77 +465,67 @@ def do_apply(cfg=None, allow_push=True):
             # still fail to start -- a port already taken is the classic one,
             # because -c never binds anything -- and the node is then simply
             # not listening, with nothing having reported a failure.
-            bad = _haproxy_not_serving()
+            bad = _haproxy_not_serving(generation)
             if bad:
-                log.error("haproxy is not serving after the reload: %s", bad)
+                log.error("haproxy did not load the new configuration after reload: %s", bad)
                 restored = _restore_previous_haproxy_cfg()
                 haproxy_took_effect = False
-                result["steps"].append("haproxy is not serving: " + bad)
+                result["steps"].append("haproxy did not load the new configuration: " + bad)
                 result.setdefault("warnings", []).append(
-                    "HAProxy accepted the reload but is not serving: %s. %s This node is "
-                    "not answering on its own address; if it holds the virtual IP, "
-                    "Keepalived will hand that over. The log says why: "
+                    "HAProxy accepted the reload but did not confirm the new configuration: "
+                    "%s. %s The log says why: "
                     "journalctl -u haproxy -n 50" % (bad, restored))
-                notify.notify("apply", "HAProxy is not serving on this node",
+                notify.notify("apply", "HAProxy did not apply the new configuration on this node",
                        "The configuration was written and validated, and the reload was "
-                       "accepted, but HAProxy is not answering afterwards: %s\n\n%s"
+                       "accepted, but the new configuration was not confirmed: %s\n\n%s"
                        % (bad, restored), "error", cfg)
             else:
                 log.info("applied: haproxy.cfg written and reloaded")
         else:
             haproxy_took_effect = False
+            result["error"] = "HAProxy reload failed: %s" % out.strip()
             log.error("applied haproxy.cfg but the reload failed: %s", out.strip()[:300])
             notify.notify("apply", "HAProxy did not reload on this node",
                    "The new configuration was written and validated, but HAProxy did not "
                    "reload, so it is still running the previous one.\n\n%s"
                    % out.strip()[:400], "error", cfg)
 
-        k = cfg["local"]["keepalived"]
-        if vrrp.keepalived_wanted(cfg):
-            if vrrp.derive_unicast(cfg):
-                result["steps"].append(
-                    "unicast peers refreshed from the node list: %s"
-                    % ((k.get("unicast_peer") or "").replace("\n", ", ") or "none -- using multicast"))
-            # Before the configuration that names it is validated, so
-            # keepalived -t is checking something that exists and a reload can
-            # never land on a missing script.
-            keepalived.write_track_script()
-            ktext = keepalived.render_keepalived(cfg)
-            fd, kstaging = tempfile.mkstemp(suffix=".conf")
-            with os.fdopen(fd, "w") as f:
-                f.write(ktext)
-            rc, out = run(["keepalived", "-t", "-f", kstaging])
-            if rc not in (0, 127):
-                os.unlink(kstaging)
-                # Loud, not a step line: keepalived.conf is left untouched here,
-                # so the node keeps whatever it had -- or never starts at all,
-                # and every node sits passive with no VIP anywhere.
-                result["steps"].append("keepalived config NOT updated")
-                result.setdefault("warnings", []).append(
-                    "Keepalived configuration was rejected, so /etc/keepalived/keepalived.conf "
-                    "was left unchanged and Keepalived is still running the old configuration "
-                    "(or not running at all). " + _keepalived_hint(out, k))
-                result["keepalived_check"] = out
-            else:
+        keepalived_took_effect = True
+        if kstaging:
+            if haproxy_took_effect:
                 KEEPALIVED_CFG.parent.mkdir(parents=True, exist_ok=True)
                 if KEEPALIVED_CFG.exists():
                     shutil.copy2(KEEPALIVED_CFG, str(KEEPALIVED_CFG) + ".bak")
                 shutil.move(kstaging, KEEPALIVED_CFG)
                 rc, out = run(["systemctl", "reload-or-restart", "keepalived"])
                 result["steps"].append("keepalived reload: " + ("ok" if rc == 0 else out))
+                if rc == 0:
+                    rc, out = run(["systemctl", "is-active", "keepalived"])
                 if rc != 0:
+                    keepalived_took_effect = False
                     result.setdefault("warnings", []).append(
                         "Keepalived did not reload: %s. Without it this node cannot take the "
                         "virtual IP." % out.strip()[:300])
+            else:
+                os.unlink(kstaging)
 
         # Advance the applied marker only if HAProxy is really running this
         # config. On a rollback or a failed reload it is not, so the marker
         # stays where it was -- the node reads dirty and asks to re-apply once
         # the cause (a taken port, say) is cleared.
-        if haproxy_took_effect:
-            cfg["_meta"]["applied_hash"] = config_hash(cfg)
+        result["local_ok"] = haproxy_took_effect and keepalived_took_effect
+        if result["local_ok"]:
+            snapshot = shared_snapshot(cfg)
+            cfg["_meta"].update(published=snapshot, applied_rev=snapshot["rev"],
+                                applied_fp=snapshot["fp"], applied_hash=config_hash(cfg))
+            cfg["_meta"].pop("apply_error", None)
+            result.update(applied_rev=snapshot["rev"], applied_fp=snapshot["fp"])
+        else:
+            result["error"] = result.get("error") or "; ".join(result.get("warnings") or
+                                       ["HAProxy did not load the new configuration."])
+            cfg["_meta"]["apply_error"] = result["error"]
         save_config(cfg)
-        result["ok"] = True
+        result["ok"] = result["local_ok"]
 
     # The push talks to every other node over the network, and an unresponsive
     # one can hold it for the full timeout. That must happen with the lock
@@ -498,11 +534,16 @@ def do_apply(cfg=None, allow_push=True):
     # This node's own revision has just moved, so the health collected before
     # it would report this node as holding something it no longer holds.
     cluster.invalidate()
-    if allow_push and cfg["local"]["sync"].get("auto_sync") and sync.enabled_peers(cfg):
+    peers = sync.enabled_peers(cfg)
+    if not peers:
+        result["cluster_ok"] = result["local_ok"]
+    if result["local_ok"] and allow_push and cfg["local"]["sync"].get("auto_sync") and peers:
         r = sync.sync_push(cfg)
-        result["steps"].append("auto-sync to %d peer(s): " % len(sync.enabled_peers(cfg)) +
+        result.update(sync=r, cluster_ok=r.get("ok", False), ok=r.get("ok", False))
+        result["steps"].append("auto-sync to %d peer(s): " % len(peers) +
                                ("ok" if r.get("ok") else str(r.get("error"))))
         if not r.get("ok"):
+            result["error"] = "Applied on this node, but not confirmed on every peer: %s" % r.get("error")
             result.setdefault("warnings", []).append(
                 "This node applied its own configuration, but syncing it to the other "
                 "nodes failed: %s" % r.get("error"))
@@ -535,6 +576,7 @@ def api_status():
     """
     cfg = load_config()
     brief = request.args.get("brief") == "1"
+    published = cfg["_meta"].get("published") or {}
 
     def svc_state(name):
         rc, out = run(["systemctl", "is-active", name])
@@ -601,6 +643,11 @@ def api_status():
         # and the revision says which.
         "config_rev": int(cfg["_meta"].get("shared_rev") or 0),
         "config_fp": cfg["_meta"].get("shared_fp") or "",
+        "published_rev": int(published.get("rev") or 0),
+        "published_fp": published.get("fp") or "",
+        "applied_rev": int(cfg["_meta"].get("applied_rev") or 0),
+        "applied_fp": cfg["_meta"].get("applied_fp") or "",
+        "apply_error": cfg["_meta"].get("apply_error") or "",
         # One tag per collection, so a disagreement can name the part it is in.
         "config_parts": shared_parts(cfg),
         # And one per object, so a disagreement can name the object rather

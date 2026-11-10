@@ -218,6 +218,13 @@ def _node_summary(st):
         "dirty": bool(st.get("dirty")),
         "config_rev": int(st.get("config_rev") or 0),
         "config_fp": st.get("config_fp") or "",
+        "published_rev": st.get("published_rev"),
+        "published_fp": st.get("published_fp") or "",
+        "supports_apply_ack": all(k in st for k in (
+            "published_rev", "published_fp", "applied_rev", "applied_fp")),
+        "applied_rev": st.get("applied_rev"),
+        "applied_fp": st.get("applied_fp") or "",
+        "apply_error": st.get("apply_error") or "",
         "config_parts": st.get("config_parts") or {},
         "config_objects": st.get("config_objects") or {},
         # The tags were left out on purpose (a brief answer), not missing.

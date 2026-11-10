@@ -5,6 +5,13 @@
    an entry that drops one. Grouped by the module the string comes from; a
    string used in several places appears once, where it first turns up. */
 export default {
+"Applied on this node.": "Toegepast op deze node.",
+"No published configuration. Apply on this node before syncing.": "Geen gepubliceerde configuratie. Pas deze op deze node toe voordat u synchroniseert.",
+"The peer returned an invalid application acknowledgement.": "De andere node heeft een ongeldige bevestiging van toepassing teruggestuurd.",
+"The peer did not confirm the requested applied revision and fingerprint. Upgrade it if it cannot report them.": "De andere node heeft de gevraagde toegepaste revisie en vingerafdruk niet bevestigd. Werk deze bij als ze niet kunnen worden gerapporteerd.",
+"Apply this node's configuration successfully before overwriting peers.": "Pas de configuratie van deze node met succes toe voordat u andere nodes overschrijft.",
+"The configuration changed while checking peers. Apply and try again.": "De configuratie is gewijzigd tijdens het controleren van andere nodes. Pas deze toe en probeer opnieuw.",
+"The received configuration does not match its fingerprint.": "De ontvangen configuratie komt niet overeen met de vingerafdruk.",
 
 /* ---- auth.js ---- */
 "Create an administrator": "Beheerder aanmaken",
@@ -1319,8 +1326,6 @@ export default {
 /* ---- shell.js ---- */
 "v{version} available": "v{version} beschikbaar",
 "Applying...": "Toepassen…",
-"FAILED: {error}": "MISLUKT: {error}",
-"HAProxy was applied, but something else needs attention:": "HAProxy is toegepast, maar iets anders vraagt aandacht:",
 "haproxy -c output": "uitvoer van haproxy -c",
 "keepalived -t output": "uitvoer van keepalived -t",
 "Apply failed": "Toepassen mislukt",

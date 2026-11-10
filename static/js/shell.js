@@ -182,20 +182,30 @@ export async function refreshStatus(){
     $("#applybtn").classList.toggle("pri",!st.dirty);
   }catch(e){/* not fatal */}
 }
+export function applySummary(r){
+  let text=r.ok
+    ?t(r.cluster_ok===true?"Applied.":"Applied on this node.")
+    :r.local_ok?t("Applied on this node.")+" "+t("Applied with problems")
+               :t("Apply FAILED: {error}",{error:r.error||""});
+  const details=[r.error,...(r.warnings||[])].filter(Boolean);
+  if(details.length)text+="\n\n"+[...new Set(details)].join("\n\n");
+  const peers=r.sync&&r.sync.results||[];
+  if(peers.length)text+="\n\n"+peers.map(p=>p.name+": "+
+    (p.ok?t("applied"):t("failed: {error}",{error:p.error||t("unknown")}))).join("\n");
+  return text;
+}
+
 export async function doApply(){
   const b=$("#applybtn");b.disabled=true;b.textContent=t("Applying...");
   try{
     const r=await api("apply","POST",{});
     const warn=r.warnings||[];
-    let text="";
-    if(!r.ok)text+=t("FAILED: {error}",{error:r.error||""})+"\n\n";
-    else if(warn.length)text+=t("HAProxy was applied, but something else needs attention:")+"\n\n";
-    else text+=t("Applied.")+"\n\n";
-    if(warn.length)text+=warn.map(w=>"!! "+w).join("\n\n")+"\n\n";
+    let text=applySummary(r)+"\n\n";
     text+=(r.steps||[]).map(s=>"* "+s).join("\n")+
       "\n\n--- "+t("haproxy -c output")+" ---\n"+(r.haproxy_check||t("(none)"))+
       (r.keepalived_check?"\n\n--- "+t("keepalived -t output")+" ---\n"+r.keepalived_check:"");
-    showText(!r.ok?t("Apply failed"):warn.length?t("Applied with problems"):t("Configuration applied"),trimHaproxy(text));
+    showText(r.local_ok&&!r.ok||warn.length?t("Applied with problems"):
+      !r.ok?t("Apply failed"):t("Configuration applied"),trimHaproxy(text));
   }catch(e){showText(t("Apply failed"),e.message);}
   b.disabled=false;b.textContent=t("Apply");
   refreshStatus();

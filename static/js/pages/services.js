@@ -1,7 +1,7 @@
 import { $, HEALTH_LABEL, PROXY_OPTIONS, api, btn, closeDlg, esc, fieldEl, fieldRow, list, openDlg, readForm, selectOption, showText, trimHaproxy } from "../core.js";
 import { describeList, describePage, describeRule } from "../entities.js";
 import { t } from "../i18n.js";
-import { refreshStatus, route } from "../shell.js";
+import { applySummary, refreshStatus, route } from "../shell.js";
 import { CERT_STATUS } from "../pages/certificates.js";
 import { state } from "../state.js";
 import { sparkCaption, trafficSpark } from "../sparkline.js";
@@ -353,7 +353,11 @@ export function openWizard(prefill){
         esc(a.type)+"</td><td class=mono>"+esc(a.name)+"</td></tr>").join("")+"</tbody></table>"+
       (r.warnings||[]).map(w=>'<div class=hint style="margin-top:10px">! '+esc(w)+"</div>").join("");
     bd.appendChild(btn(t("Show the generated haproxy.cfg"),"sm",()=>showText(t("haproxy.cfg (preview)"),r.preview)));
-    if(saved&&r.applied)bd.appendChild(document.createTextNode(" "+(r.applied.ok?t("Applied."):t("Apply FAILED: {error}",{error:r.applied.error||""}))));
+    if(saved&&r.applied){
+      const applied=document.createElement("div");applied.className=r.applied.ok?"hint":"err";
+      applied.style.whiteSpace="pre-wrap";applied.textContent=applySummary(r.applied);
+      bd.appendChild(applied);
+    }
     box.appendChild(bd);out.appendChild(box);
   };
 

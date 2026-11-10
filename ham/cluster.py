@@ -194,6 +194,31 @@ def cluster_snapshot(cfg=None):
             "and apply from it, or use Overwrite to replace what is on the others."
             % (newest, differs_in))
 
+    published_rev = max((n.get("published_rev") or 0 for n in reachable), default=0)
+    published_fps = {n.get("published_fp") for n in reachable
+                     if n.get("published_rev") == published_rev and n.get("published_fp")}
+    if len(published_fps) > 1:
+        warnings.append("The nodes published different configurations at revision %d."
+                        % published_rev)
+    participants = [n for n in nodes if n.get("error") != "disabled"]
+    unconfirmed = []
+    for n in reachable:
+        if n.get("supports_apply_ack") is False:
+            warnings.append(
+                "%s cannot confirm applied configurations. Upgrade this node before "
+                "using automatic synchronization." % n["name"])
+        if not n.get("published_fp") or n.get("published_rev") != published_rev or \
+                n.get("published_fp") not in published_fps or \
+                n.get("applied_rev") != published_rev or \
+                n.get("applied_fp") != n.get("published_fp") or n.get("apply_error"):
+            unconfirmed.append(n["name"])
+            warnings.append(
+                "%s has not confirmed published revision %d: %s"
+                % (n["name"], published_rev,
+                   n.get("apply_error") or "application pending or not reported"))
+    publication_agreed = bool(len(published_fps) == 1 and not unconfirmed and
+                              all(n.get("reachable") for n in participants))
+
     # Each node reports what it can see, so a node that vanishes is reported
     # by each of its peers -- which also tells you who lost sight of it.
     for n in nodes:
@@ -211,8 +236,8 @@ def cluster_snapshot(cfg=None):
                               "virtual IP, check that another node has taken it over."
                               % (n.get("url"), socket.gethostname(), n.get("error")),
                               "error", cfg)
-    _report_drift(cfg, bool(behind or not agree),
-                  warnings[-1] if (behind or not agree) else "")
+    diverged = bool(behind or not agree or not publication_agreed)
+    _report_drift(cfg, diverged, warnings[-1] if diverged and warnings else "")
 
     if len(holders) > 1:
         notify.notify_transition("cluster:splitbrain", "split", "cluster",
@@ -232,7 +257,10 @@ def cluster_snapshot(cfg=None):
                     "active": len(holders), "warnings": warnings,
                     # What the Cluster page needs to show agreement at a glance
                     # and to offer to fix it.
-                    "config_rev": newest, "config_agreed": bool(agree and not behind),
+                    "config_rev": newest,
+                    "config_agreed": bool(agree and not behind and publication_agreed),
+                    "published_rev": published_rev,
+                    "publication_agreed": publication_agreed,
                     "config_behind": [n["name"] for n in behind],
                     "config_differs_in": differs_in},
         "taken": datetime.now(timezone.utc).isoformat(timespec="seconds"),
