@@ -40,8 +40,8 @@ class DeploymentTests(unittest.TestCase):
         ])
         self.args = [
             "--hostname-a", "proxy-a", "--hostname-b", "proxy-b",
-            "--ip-a", "172.20.0.11", "--ip-b", "172.20.0.12",
-            "--interface-a", "ens192", "--interface-b", "ens224",
+            "--mng-ip-a", "172.20.0.11", "--mng-ip-b", "172.20.0.12",
+            "--vrrp-interface-a", "ens192", "--vrrp-interface-b", "ens224",
             "--vrrp-ip-a", "10.40.0.11", "--vrrp-ip-b", "10.40.0.12",
             "--vip", "10.40.0.100/25", "--vrid", "91",
             "--api-key", self.secrets[0], "--admin-password", self.secrets[1],
@@ -83,6 +83,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(raw["cluster"], {"vips": "10.40.0.100/25", "vrid": 91})
         local = raw["local"]
         self.assertEqual(local["node_url"], "http://172.20.0.11:8080")
+        self.assertEqual(local["sync"]["peers"][0]["url"], "http://172.20.0.12:8080")
         self.assertEqual(local["api_key"], self.secrets[0])
         self.assertEqual(local["sync"]["peers"][0]["api_key"], self.secrets[0])
         self.assertEqual(local["keepalived"], {
@@ -103,6 +104,7 @@ class DeploymentTests(unittest.TestCase):
         env = (self.data / "manager.env").read_text()
         self.assertIn("HAM_ADMIN_USER=operator\n", env)
         self.assertIn("HAM_ADMIN_PASSWORD=" + self.secrets[1] + "\n", env)
+        self.assertIn("HAM_PORT=8080\n", env)
         for path in (self.data / "manager/config.json", self.data / "manager.env",
                      self.data / "api-header"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -123,22 +125,51 @@ class DeploymentTests(unittest.TestCase):
             {"ifname": "mgmt0", "addr_info": [{"local": "172.20.0.12"}]},
             {"ifname": "ens224", "operstate": "UP", "addr_info": [{"local": "10.40.0.12"}]},
         ])
-        result = self.invoke(env={"TEST_HOSTNAME": "proxy-b", "TEST_ADDRESSES": addresses})
+        result = self.invoke(["--mng-port", "18090"],
+                             env={"TEST_HOSTNAME": "proxy-b", "TEST_ADDRESSES": addresses})
         self.assertEqual(result.returncode, 0, result.stderr)
         raw = json.loads((self.data / "manager/config.json").read_text())
         self.assertEqual(set(raw), {"local"})
         self.assertEqual(raw["local"]["api_key"], self.secrets[0])
         self.assertEqual(raw["local"]["sync"]["peers"][0]["api_key"], self.secrets[0])
-        self.assertEqual(raw["local"]["node_url"], "http://172.20.0.12:8080")
+        self.assertEqual(raw["local"]["node_url"], "http://172.20.0.12:18090")
         self.assertEqual(raw["local"]["keepalived"]["interface"], "ens224")
         self.assertEqual(raw["local"]["keepalived"]["unicast_src"], "10.40.0.12")
-        self.assertEqual(raw["local"]["sync"]["peers"][0]["url"], "http://172.20.0.11:8080")
+        self.assertEqual(raw["local"]["sync"]["peers"][0]["url"], "http://172.20.0.11:18090")
+        self.assertIn("HAM_PORT=18090\n", (self.data / "manager.env").read_text())
         CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONF_PATH.write_text(json.dumps(raw))
         cfg = load_config()
         check_file_config(cfg)
         self.assertEqual(startup._decision(cfg, [], [])[0], "wait")
         self.assertIn(self.secrets[0], (self.data / "api-header").read_text())
+
+    def test_custom_management_port_updates_urls_and_frees_default_port(self):
+        result = self.invoke([
+            "--mng-port", "18090",
+            "--tcp-forward", "app", "8080", "10.60.0.22", "80",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        raw = json.loads((self.data / "manager/config.json").read_text())
+        self.assertEqual(raw["local"]["node_url"], "http://172.20.0.11:18090")
+        self.assertEqual(raw["local"]["sync"]["peers"][0]["url"], "http://172.20.0.12:18090")
+        self.assertIn("HAM_PORT=18090\n", (self.data / "manager.env").read_text())
+        self.assertEqual(raw["haproxy"]["frontends"][-1]["binds"], "10.40.0.100:8080")
+
+    def test_invalid_or_conflicting_management_ports_fail_before_host_changes(self):
+        for port in ("0", "65536", "not-a-port"):
+            with self.subTest(port=port):
+                result = self.invoke(["--mng-port", port])
+                self.assert_no_changes(result)
+                self.assertIn("--mng-port must be an integer", result.stderr)
+        for extra in (
+                ["--mng-port", "18080"],
+                ["--mng-port", "18090",
+                 "--tcp-forward", "bad", "18090", "10.60.0.22", "80"]):
+            with self.subTest(extra=extra):
+                result = self.invoke(extra)
+                self.assert_no_changes(result)
+                self.assertIn("is reserved for the management API", result.stderr)
 
     def test_multiple_vips_share_ports_but_keep_their_own_tcp_targets(self):
         result = self.invoke(args=self.multi_vip_args())
@@ -278,7 +309,7 @@ class DeploymentTests(unittest.TestCase):
 
     def test_invalid_arguments_fail_before_host_changes(self):
         cases = [
-            ["--hostname-b", "proxy-a"], ["--ip-a", "999.1.1.1"],
+            ["--hostname-b", "proxy-a"], ["--mng-ip-a", "999.1.1.1"],
             ["--vip", "10.40.0.100"], ["--vip", "10.40.0.100/33"],
             ["--vip", "10.40.0.11/25"], ["--vrid", "256"],
             ["--priority-a", "0"], ["--tcp-forward", "bad", "8080", "10.60.0.20", "80"],

@@ -9,10 +9,10 @@ Usage: bash tools/deploy-two-nodes-docker.sh [options]
 Required:
   --hostname-a NAME              Exact output of hostname on host A
   --hostname-b NAME              Exact output of hostname on host B
-  --ip-a IPV4                    Host A's fixed management address
-  --ip-b IPV4                    Host B's fixed management address
-  --interface-a NAME             Host A's interface carrying the VIPs
-  --interface-b NAME             Host B's interface carrying the VIPs
+  --mng-ip-a IPV4                Host A's fixed management address
+  --mng-ip-b IPV4                Host B's fixed management address
+  --vrrp-interface-a NAME        Host A's interface carrying the VIPs
+  --vrrp-interface-b NAME        Host B's interface carrying the VIPs
   --vrrp-ip-a IPV4               Host A's fixed address on that interface
   --vrrp-ip-b IPV4               Host B's fixed address on that interface
   --vip IPV4/PREFIX              Shared business VIP; repeat for multiple VIPs
@@ -25,6 +25,7 @@ Required:
                                  With only one VIP, PORT alone is also accepted
 
 Optional:
+  --mng-port PORT                Both hosts' UI/API port (default: 8080)
   --admin-user NAME              Initial UI administrator (default: admin)
   --image REFERENCE              Image tag or digest
                                  (default: ghcr.io/daocloud/haproxy-manager:latest)
@@ -74,8 +75,9 @@ ipv4() {
   done
 }
 
-hostname_a= hostname_b= ip_a= ip_b= interface_a= interface_b=
+hostname_a= hostname_b= mng_ip_a= mng_ip_b= interface_a= interface_b=
 vrrp_ip_a= vrrp_ip_b= vrid= api_key= admin_password=
+mng_port=8080
 admin_user=admin
 image=ghcr.io/daocloud/haproxy-manager:latest
 data_dir=/opt/haproxy-manager/data
@@ -93,8 +95,9 @@ while (( $# )); do
       shift 5
       continue
       ;;
-    --hostname-a|--hostname-b|--ip-a|--ip-b|--interface-a|--interface-b|\
-    --vrrp-ip-a|--vrrp-ip-b|--vip|--vrid|--api-key|--admin-password|\
+    --hostname-a|--hostname-b|--mng-ip-a|--mng-ip-b|--mng-port|\
+    --vrrp-interface-a|--vrrp-interface-b|--vrrp-ip-a|--vrrp-ip-b|\
+    --vip|--vrid|--api-key|--admin-password|\
     --admin-user|--image|--data-dir|--priority-a|--priority-b)
       values 1 "$@"
       ;;
@@ -103,10 +106,11 @@ while (( $# )); do
   case "$1" in
     --hostname-a) hostname_a=$2 ;;
     --hostname-b) hostname_b=$2 ;;
-    --ip-a) ip_a=$2 ;;
-    --ip-b) ip_b=$2 ;;
-    --interface-a) interface_a=$2 ;;
-    --interface-b) interface_b=$2 ;;
+    --mng-ip-a) mng_ip_a=$2 ;;
+    --mng-ip-b) mng_ip_b=$2 ;;
+    --mng-port) mng_port=$2 ;;
+    --vrrp-interface-a) interface_a=$2 ;;
+    --vrrp-interface-b) interface_b=$2 ;;
     --vrrp-ip-a) vrrp_ip_a=$2 ;;
     --vrrp-ip-b) vrrp_ip_b=$2 ;;
     --vip) vips+=("$2") ;;
@@ -124,10 +128,10 @@ done
 
 required --hostname-a "$hostname_a"
 required --hostname-b "$hostname_b"
-required --ip-a "$ip_a"
-required --ip-b "$ip_b"
-required --interface-a "$interface_a"
-required --interface-b "$interface_b"
+required --mng-ip-a "$mng_ip_a"
+required --mng-ip-b "$mng_ip_b"
+required --vrrp-interface-a "$interface_a"
+required --vrrp-interface-b "$interface_b"
 required --vrrp-ip-a "$vrrp_ip_a"
 required --vrrp-ip-b "$vrrp_ip_b"
 (( ${#vips[@]} )) || die "At least one --vip is required; see --help."
@@ -136,14 +140,14 @@ required --api-key "$api_key"
 required --admin-password "$admin_password"
 (( ${#forwards[@]} )) || die "At least one --tcp-forward is required."
 [[ "$hostname_a" != "$hostname_b" ]] || die "Hostnames must be different."
-[[ "$ip_a" != "$ip_b" && "$vrrp_ip_a" != "$vrrp_ip_b" ]] ||
+[[ "$mng_ip_a" != "$mng_ip_b" && "$vrrp_ip_a" != "$vrrp_ip_b" ]] ||
   die "The two hosts need different management and VRRP addresses."
 [[ "$admin_user" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "--admin-user contains invalid characters."
 for interface in "$interface_a" "$interface_b"; do
   [[ "$interface" != lo && "$interface" =~ ^[a-zA-Z0-9_.:-]+$ ]] ||
     die "VIP interfaces must be non-loopback interface names."
 done
-for address in "$ip_a" "$ip_b" "$vrrp_ip_a" "$vrrp_ip_b"; do
+for address in "$mng_ip_a" "$mng_ip_b" "$vrrp_ip_a" "$vrrp_ip_b"; do
   ipv4 "Node addresses" "$address"
 done
 declare -A vip_addresses=()
@@ -154,13 +158,14 @@ for vip in "${vips[@]}"; do
   number "VIP prefix" "${vip##*/}" 1 32
   [[ ! ${vip_addresses[$vip_ip]+present} ]] || die "VIP addresses must be unique."
   vip_addresses[$vip_ip]=1
-  for address in "$ip_a" "$ip_b" "$vrrp_ip_a" "$vrrp_ip_b"; do
+  for address in "$mng_ip_a" "$mng_ip_b" "$vrrp_ip_a" "$vrrp_ip_b"; do
     [[ "$vip_ip" != "$address" ]] || die "A VIP must not be a node's fixed address."
   done
 done
 number --vrid "$vrid" 1 255
 number --priority-a "$priority_a" 1 255
 number --priority-b "$priority_b" 1 255
+number --mng-port "$mng_port" 1 65535
 declare -A names=() binds=()
 for (( i=0; i<${#forwards[@]}; i+=4 )); do
   name=${forwards[i]}
@@ -180,7 +185,8 @@ for (( i=0; i<${#forwards[@]}; i+=4 )); do
   fi
   number "Listener port" "$port" 1 65535
   number "Backend port" "${forwards[i+3]}" 1 65535
-  [[ "$port" != 8080 ]] || die "Listener port 8080 is reserved for the management API."
+  [[ "$port" != "$mng_port" ]] ||
+    die "Listener port $mng_port is reserved for the management API."
   bind=$vip_ip:$port
   [[ ! ${names[$name]+present} && ! ${binds[$bind]+present} ]] ||
     die "Rule names and VIP:PORT listener pairs must be unique."
@@ -215,12 +221,12 @@ fi
 node_name=$(hostname)
 case "$node_name" in
   "$hostname_a")
-    node=A; node_ip=$ip_a; peer_ip=$ip_b
+    node=A; node_ip=$mng_ip_a; peer_ip=$mng_ip_b
     interface=$interface_a; priority=$priority_a
     vrrp_self=$vrrp_ip_a; vrrp_peer=$vrrp_ip_b
     ;;
   "$hostname_b")
-    node=B; node_ip=$ip_b; peer_ip=$ip_a
+    node=B; node_ip=$mng_ip_b; peer_ip=$mng_ip_a
     interface=$interface_b; priority=$priority_b
     vrrp_self=$vrrp_ip_b; vrrp_peer=$vrrp_ip_a
     ;;
@@ -257,7 +263,8 @@ existing=$(docker ps -a --filter 'name=^/haproxy-manager$' --format '{{.Names}}'
 log "preflight passed; pulling $image"
 docker pull "$image"
 
-jq -n --arg node "$node" --arg self "http://$node_ip:8080" --arg peer "http://$peer_ip:8080" \
+jq -n --arg node "$node" --arg self "http://$node_ip:$mng_port" \
+  --arg peer "http://$peer_ip:$mng_port" \
   --rawfile key "$staging/api-key" \
   --arg interface "$interface" --argjson priority "$priority" \
   --arg source "$vrrp_self" --arg destination "$vrrp_peer" \
@@ -287,9 +294,10 @@ jq -n --arg node "$node" --arg self "http://$node_ip:8080" --arg peer "http://$p
       }
     }
   else {} end)' "${forwards[@]}" > "$staging/config.json"
-jq -nr --arg user "$admin_user" --rawfile password "$staging/admin-password" '
+jq -nr --arg user "$admin_user" --arg port "$mng_port" \
+  --rawfile password "$staging/admin-password" '
   "HAM_ADMIN_USER=" + $user, "HAM_ADMIN_PASSWORD=" + $password,
-  "HAM_LISTEN=0.0.0.0", "HAM_APPLY_ON_START=1"' > "$staging/manager.env"
+  "HAM_LISTEN=0.0.0.0", "HAM_PORT=" + $port, "HAM_APPLY_ON_START=1"' > "$staging/manager.env"
 jq -nr --rawfile key "$staging/api-key" '"X-API-Key: " + $key' > "$staging/api-header"
 printf 'net.ipv4.ip_nonlocal_bind = 1\n' > "$staging/sysctl.conf"
 
@@ -313,4 +321,4 @@ docker run -d --name haproxy-manager --hostname "$node_name" \
   -v "$data_dir/haproxy:/etc/haproxy" \
   -v "$data_dir/keepalived:/etc/keepalived" "$image"
 log "container started; this does not confirm startup Apply or peer convergence"
-log "check /api/status?brief=1 with the header file $data_dir/api-header and inspect docker logs"
+log "check http://$node_ip:$mng_port/api/status?brief=1 with the header file $data_dir/api-header and inspect docker logs"
