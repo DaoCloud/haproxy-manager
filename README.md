@@ -27,17 +27,6 @@ HAProxy，并使用 Keepalived 实现共享虚拟 IP（VIP）和节点故障切�
 直接使用本仓库发布的 `ghcr.io/daocloud/haproxy-manager:latest` 镜像，
 两节点应使用相同的仓库 digest。
 
-部署脚本通过 `--mng-ip-a/b` 指定两节点的固定管理地址，用于 UI/API 访问和节点间同步。
-可选参数 `--mng-port` 指定两节点共用的管理端口，默认 `8080`。
-例如 `--mng-port 18090` 会让 UI/API 和同步连接使用 TCP 18090。
-管理地址参数不限制监听范围，UI/API 仍监听宿主机全部 IPv4 接口。
-
-镜像版本直接使用原始 Git tag，例如 `V1.0.0` 对应镜像 `:V1.0.0`，保留大小写。
-`main` 和手动构建使用 `sha-<commit>`，并更新 `latest`。正式版本 tag 也更新 `latest`，
-预发布 tag（例如 `V1.0.0-beta.1`）不更新 `latest`，不再每周定时重建镜像。
-应用显示的版本仍来自 `VERSION` 文件，与镜像 tag 独立维护。新版本检测已禁用，
-容器升级需拉取目标镜像并重新创建容器。
-
 部署前确认两节点具备 rootful Docker，网络允许 VIP 漂移、ARP 更新和
 **IP 协议 112（VRRP，不是 TCP/UDP 端口 112）** 双向通信。
 管理端口（默认 8080）仅允许节点和授权管理主机访问，不要暴露到公网。
