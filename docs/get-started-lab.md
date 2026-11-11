@@ -18,7 +18,7 @@ Mac 或其他电脑可以通过浏览器访问管理 UI，但不能默认直连�
 HAM_LAB_UI_BIND=0.0.0.0 python3 tools/integration/lab.py up
 ```
 
-脚本会构建当前工作区的代码、创建独立网络和数据卷、启动三个容器，
+脚本默认会构建当前工作区的代码、创建独立网络和数据卷、启动三个容器，
 并初始化双节点集群、VIP 和两条 TCP 转发规则。启动后环境持续运行。
 重复执行会保留已有配置，而不会重新创建初始规则。
 
@@ -33,6 +33,25 @@ HAM_LAB_UI_BIND=0.0.0.0 python3 tools/integration/lab.py up
 
 再次执行 `up` 时需保留这个环境变量，否则 UI 映射会恢复为默认的 `127.0.0.1`。
 演示账号是公开的，UI 使用 HTTP，只应在可信网络中开放。
+
+### 使用已发布镜像
+
+设置实验启动脚本的环境变量 `HAM_LAB_IMAGE`，让两个代理节点使用指定的镜像，
+而不是构建当前工作区的应用代码：
+
+```bash
+HAM_LAB_IMAGE=ghcr.io/daocloud/haproxy-manager:V1.0.0 \
+HAM_LAB_UI_BIND=0.0.0.0 python3 tools/integration/lab.py up
+```
+
+将示例 tag 替换为待测的已发布版本，也可以使用完整的 `镜像名@sha256:...`。
+每次启动都会执行 `docker pull` 拉取指定镜像，拉取失败时直接报错，不会回退到本地构建。
+实验用 HTTP/HTTPS backend 仍从本地构建，因此仍需本仓库源码。
+未设置 `HAM_LAB_IMAGE` 或其值为空时，保留默认的本地构建行为，Docker 可以复用构建缓存。
+
+再次执行 `up` 时需保留同一个 `HAM_LAB_IMAGE`，否则脚本会重新使用工作区代码。
+`test` 命令也支持该环境变量，在独立临时集群中验证指定镜像。
+切换镜像不会清空已有数据卷；需要全新环境时，先执行 `down`，它会删除已有实验配置。
 
 ## 3. 打开管理 UI
 
