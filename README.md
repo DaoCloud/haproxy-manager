@@ -50,7 +50,7 @@ HAProxy，并使用 Keepalived 实现共享虚拟 IP（VIP）和节点故障切�
 python3 tools/integration/lab.py up
 ```
 
-脚本会构建当前工作区的代码，启动两个代理节点和一个 HTTP/HTTPS backend，
+脚本默认会构建当前工作区的代码，启动两个代理节点和一个 HTTP/HTTPS backend，
 并配置 VIP 和两条 TCP 转发规则。HTTPS 使用 TLS passthrough，自签名证书的私钥只由 backend 持有。
 终端会打印 UI 地址、演示登录信息、VIP 和 backend 地址。重复执行 `up` 会保留已有配置。
 
@@ -67,6 +67,21 @@ HAM_LAB_UI_BIND=0.0.0.0 python3 tools/integration/lab.py up
 然后打开 `http://<宿主机 IP>:18081` 或 `http://<宿主机 IP>:18082`。
 **只应在可信网络中这样使用**，因为演示账号是公开的，且 UI 使用 HTTP。
 再次执行 `up` 时需保留同一个环境变量。
+
+**`HAM_LAB_IMAGE`：指定在线应用镜像，跳过本地应用构建。**
+
+如需使用已发布镜像，在启动命令前设置该环境变量：
+
+```bash
+HAM_LAB_IMAGE=ghcr.io/daocloud/haproxy-manager:V1.0.0 \
+HAM_LAB_UI_BIND=0.0.0.0 python3 tools/integration/lab.py up
+```
+
+将示例 tag 替换为待测的已发布版本，也可以指定完整的 `镜像名@sha256:...`。
+脚本每次会拉取指定镜像，两个代理节点使用同一镜像，不再构建工作区的应用代码；
+实验 backend 仍从本地构建。拉取失败时直接报错，不会回退到本地构建。
+未设置 `HAM_LAB_IMAGE` 或其值为空时，默认构建当前工作区的应用代码。
+`test` 命令也支持该环境变量。再次执行 `up` 时需保留同一个镜像设置，否则恢复本地构建。
 
 VIP 位于独立的 Docker bridge 网络中，不在宿主机的局域网上。
 检查转发时，在 Docker 宿主机的项目根目录执行：

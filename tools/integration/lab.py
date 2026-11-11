@@ -553,7 +553,7 @@ class Lab:
     def __init__(self, testing=False):
         base = "ham-lab-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
         self.project = base + ("-test-" + secrets.token_hex(3) if testing else "")
-        self.env = dict(os.environ, LAB_IMAGE=base + ":local",
+        self.env = dict(os.environ, LAB_IMAGE=os.environ.get("HAM_LAB_IMAGE") or base + ":local",
                         LAB_BACKEND_IMAGE=base + "-backend:local", LAB_PROJECT=self.project,
                         LAB_UI_BIND="127.0.0.1" if testing else os.environ.get(
                             "HAM_LAB_UI_BIND", "127.0.0.1"),
@@ -607,9 +607,15 @@ class Lab:
             args.append(node)
         return self.compose(*args, capture=capture)
 
-    def up(self):
-        self.compose("build", "proxy-a")
+    def prepare_images(self):
+        if self.env.get("HAM_LAB_IMAGE"):
+            self.command(["docker", "pull", self.env["LAB_IMAGE"]])
+        else:
+            self.compose("build", "proxy-a")
         self.compose("build", "backend")
+
+    def up(self):
+        self.prepare_images()
         self.compose("up", "-d", "--no-build")
         self.phase("_init")
 
@@ -627,7 +633,7 @@ class Lab:
     def test_tcp_deployment(self):
         from deploy_fixture import DeploymentFixture
 
-        self.compose("build", "proxy-a", "backend")
+        self.prepare_images()
         self.compose("up", "-d", "--no-build", "--wait", "backend")
         with tempfile.TemporaryDirectory(prefix="ham-tcp-deploy-") as directory:
             root = Path(directory)
@@ -737,7 +743,7 @@ class Lab:
 
     def test_startup(self):
         self.env["LAB_STARTUP_TEST"] = "1"
-        self.compose("build", "proxy-a", "backend")
+        self.prepare_images()
         self.compose("up", "-d", "--no-build", "backend")
         self.seed_nodes()
         self.compose("up", "-d", "--no-build", "proxy-b")
