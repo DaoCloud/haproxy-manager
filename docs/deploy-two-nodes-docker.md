@@ -35,14 +35,17 @@ B 首次同步后保存完整配置，之后可独立重启并接管全部 VIP�
   云平台对辅助 IP 的限制需先处理，VIP 不能与其他设备的固定地址冲突。
 - VPN 客户端需要到全部 VIP 的路由，网络需要允许相应 TCP 端口，并保证回程可达。
   两个代理节点都必须能访问全部 backend。
-- 管理端口 TCP 8080 只允许集群节点和授权管理主机访问，不要开放给普通 VPN 用户或公网。
+- 管理端口默认 TCP 8080，可通过部署脚本的 `--mng-port` 修改。
+  该端口只允许集群节点和授权管理主机访问，不要开放给普通 VPN 用户或公网。
 - 以下 HTTP 管理连接不加密密码、API key 或同步内容，只适用于隔离、可信网络。
   跨不可信网络时，先建立经过认证的加密通道。VRRP 的 PASS 认证不能替代加密。
 - 宿主机不能有其他服务占用相同监听地址和端口，也不能有其他 Keepalived 管理这些 VIP。
 
 在每台主机执行 `ip -br -4 addr`，确认承载 VIP 的接口及固定 IPv4 地址。
-部署脚本的 `--interface-a/b` 和 `--vrrp-ip-a/b` 指定 Keepalived 使用的业务网接口和地址。
-`--ip-a/b` 是管理连接地址，可以在另一张网卡上，**不能填任何 VIP**。
+部署脚本的 `--vrrp-interface-a/b` 和 `--vrrp-ip-a/b` 指定 Keepalived 使用的业务网接口和地址。
+`--mng-ip-a/b` 是管理连接地址，用于生成本机和 peer 的管理 URL，
+可以在另一张网卡上，**不能填任何 VIP**，也不会限制 UI/API 的监听地址。
+`--mng-port` 指定两节点共用的 UI/API 端口，默认 `8080`。
 
 HAProxy 按规则里的 `VIP:端口` 监听，不按网卡名称监听。
 backend 访问和业务回包由宿主机路由决定。默认由 HAProxy 新建到 backend 的 TCP 连接，
@@ -87,8 +90,9 @@ ADMIN_PASSWORD='K0Xpv!cc!!t#amhI'
 ```bash
 bash tools/deploy-two-nodes-docker.sh \
   --hostname-a proxy-a --hostname-b proxy-b \
-  --ip-a 10.20.0.11 --ip-b 10.20.0.12 \
-  --interface-a eth0 --interface-b eth0 \
+  --mng-ip-a 10.20.0.11 --mng-ip-b 10.20.0.12 \
+  --mng-port 8080 \
+  --vrrp-interface-a eth0 --vrrp-interface-b eth0 \
   --vrrp-ip-a 10.20.0.11 --vrrp-ip-b 10.20.0.12 \
   --vip 10.20.0.100/24 \
   --vip 10.20.0.101/24 \
@@ -106,6 +110,11 @@ bash tools/deploy-two-nodes-docker.sh \
 |---|---|
 | `https://10.20.0.100/` | `10.30.0.20:8443` |
 | `https://10.20.0.101/` | `10.30.0.21:9443` |
+
+管理 UI 分别通过 `http://10.20.0.11:8080` 和 `http://10.20.0.12:8080` 访问。
+例如将部署脚本的参数改为 `--mng-port 18090`，两节点的 UI/API 和同步连接都会使用
+TCP 18090；后文管理请求中的 `8080` 也需替换为 `18090`，防火墙应限制对应端口。
+这不会改变业务 `VIP:端口` 或 Keepalived 的 VRRP 通信。
 
 重复 `--vip` 声明多个 VIP，重复 `--tcp-forward` 定义转发规则。
 每条规则填写**规则名、入口 VIP:端口、backend 地址、backend 端口**。
@@ -136,8 +145,9 @@ TCP passthrough 不改写 HTTP Host、响应中的重定向或 Cookie，也不�
 | 参数 | 要求与默认值 |
 |---|---|
 | `--hostname-a/b` | 必填，两个不同的宿主机 hostname，必须与本机实际输出精确匹配 |
-| `--ip-a/b` | 必填，两个不同的固定管理 IPv4 地址，管理端口为 TCP 8080 |
-| `--interface-a/b` | 必填，各节点承载全部 VIP 的非 loopback 接口 |
+| `--mng-ip-a/b` | 必填，两个不同的固定管理 IPv4 地址，用于本机和 peer 的管理 URL，不限制监听地址 |
+| `--mng-port` | 默认 `8080`，范围 1–65535，两节点共用的 UI/API 和同步端口 |
+| `--vrrp-interface-a/b` | 必填，各节点承载全部 VIP 的非 loopback 接口 |
 | `--vrrp-ip-a/b` | 必填，业务接口上的固定 IPv4 地址，可与管理地址相同 |
 | `--vip IPV4/PREFIX` | 至少一项，可重复；同一 IPv4 地址不能重复声明 |
 | `--vrid` | 必填，1–255；全部 VIP 共用这一个 VRID |
@@ -151,7 +161,8 @@ TCP passthrough 不改写 HTTP Host、响应中的重定向或 Cookie，也不�
 | `--help` | 查看完整用法 |
 
 转发规则名只能包含字母、数字、下划线和连字符，且以字母或数字开头。
-规则名及 `VIP:端口` 组合不得重复，TCP 8080 保留给管理入口。
+规则名及 `VIP:端口` 组合不得重复，`--mng-port` 指定的端口保留给管理入口。
+修改管理端口后，原来的 TCP 8080 可以用于业务转发。
 脚本检查 VIP、规则、凭据、本机接口与固定地址，以及 rootful Docker，并记录入口与 backend 映射。
 发现已有同名容器或非空数据目录时拒绝初始化，不覆盖已有安装。
 失败会输出错误并保留已经写入的文件，先检查现场，不要盲目重复初始化。
@@ -163,8 +174,10 @@ A 写入全部共享 VIP 和 TCP 规则，B 只写入本机身份和 peer，随�
 已有安装仍可保留各节点独立的 API key，不要求改成共享 key。
 
 manager 容器的环境变量 `HAM_APPLY_ON_START=1` 使进程每次启动时校验、协调并应用配置，
-是本镜像的默认值。`HAM_LISTEN=0.0.0.0` 使 UI/API 监听全部 IPv4 接口，
-包括健康检查所用的 `127.0.0.1`，需按第 1 节限制访问。
+是本镜像的默认值。部署脚本将管理端口写入 manager 容器的环境变量 `HAM_PORT`，
+例如 `--mng-port 18090` 会生成 `HAM_PORT=18090`，让 UI/API 在 TCP 18090 上接收连接。
+manager 容器的环境变量 `HAM_LISTEN=0.0.0.0` 使 UI/API 监听全部 IPv4 接口，
+包括健康检查所用的 `127.0.0.1`，不是只监听 `--mng-ip-a/b` 指定的地址，需按第 1 节限制访问。
 `HAM_ADMIN_USER/PASSWORD` 只在没有管理员时初始化登录，不会重置已有账号。
 
 宿主机内核参数 `net.ipv4.ip_nonlocal_bind=1` 允许 standby 上的 HAProxy 提前绑定尚未持有的 VIP。

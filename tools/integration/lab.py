@@ -643,8 +643,8 @@ class Lab:
                 fixture = DeploymentFixture(owned)
                 args = [
                     "--hostname-a", "proxy-a", "--hostname-b", "proxy-b",
-                    "--ip-a", self.env["LAB_A"], "--ip-b", self.env["LAB_B"],
-                    "--interface-a", "eth0", "--interface-b", "eth0",
+                    "--mng-ip-a", self.env["LAB_A"], "--mng-ip-b", self.env["LAB_B"],
+                    "--vrrp-interface-a", "eth0", "--vrrp-interface-b", "eth0",
                     "--vrrp-ip-a", self.env["LAB_A"], "--vrrp-ip-b", self.env["LAB_B"],
                     "--vip", self.env["LAB_VIP"] + "/24",
                     "--vip", self.env["LAB_VIP_2"] + "/24", "--vrid", "77",
