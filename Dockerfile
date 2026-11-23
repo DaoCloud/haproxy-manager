@@ -15,7 +15,7 @@ FROM debian:trixie-slim
 # stock package is always an old LTS. That repository tracks one branch per
 # suite, for amd64 and arm64, and publishes each point release as it comes.
 ARG HAPROXY_BRANCH=3.4
-ARG ACME_VERSION=3.1.6
+ARG ACME_VERSION=3.1.7
 
 ENV DEBIAN_FRONTEND=noninteractive
 
