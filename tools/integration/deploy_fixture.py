@@ -69,7 +69,7 @@ class DeploymentFixture:
                         TEST_ROOT=str(self.root), TEST_REAL_JQ=shutil.which("jq") or "",
                         TEST_REAL_INSTALL=shutil.which("install") or "", TMPDIR=str(self.stage))
 
-    def run(self, args, env=None):
-        script = Path(__file__).resolve().parents[1] / "deploy-two-nodes-docker.sh"
-        return subprocess.run(["bash", str(script), *args], text=True, capture_output=True,
+    def run(self, args, env=None, script="deploy-two-nodes-docker.sh"):
+        script_path = Path(__file__).resolve().parents[1] / script
+        return subprocess.run(["bash", str(script_path), *args], text=True, capture_output=True,
                               env=self.env | (env or {}))
