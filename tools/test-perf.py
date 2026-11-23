@@ -174,7 +174,9 @@ def fake_query(peer, timeout=None, brief=False):
 
 
 real_query = peering._query_peer
+real_version = apply.VERSION
 peering._query_peer = fake_query
+apply.VERSION = "2.0.0"
 fps.update(p2=my_fp, p3=my_fp)
 snap = cluster.cluster_snapshot()
 ok(calls == [("p2", True), ("p3", True)] and snap["summary"]["config_agreed"],
@@ -190,6 +192,7 @@ ok(sorted(calls) == [("p2", False), ("p2", True), ("p3", False), ("p3", True)]
 ok(all(n["config_objects"] for n in snap["nodes"] if not n["self"]),
    "and the snapshot holds the full answers")
 peering._query_peer = real_query
+apply.VERSION = real_version
 cfg = load_config()
 cfg["local"]["sync"]["peers"] = []
 save_config(cfg)

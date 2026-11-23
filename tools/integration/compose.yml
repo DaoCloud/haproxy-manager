@@ -39,6 +39,25 @@ services:
       - b-haproxy:/etc/haproxy
       - b-keepalived:/etc/keepalived
 
+  proxy-single:
+    image: ${LAB_IMAGE:?}
+    profiles: ["single"]
+    hostname: proxy-single
+    environment:
+      HAM_ADMIN_USER: admin
+      HAM_ADMIN_PASSWORD: lab-demo-password
+      HAM_DRY_RUN: "0"
+      NO_PROXY: "*"
+    stop_grace_period: 5s
+    networks:
+      lab:
+        ipv4_address: ${LAB_SINGLE:?}
+    volumes:
+      - single-data:/var/lib/haproxy-manager
+      - single-acme:/var/lib/acme.sh
+      - single-haproxy:/etc/haproxy
+      - single-keepalived:/etc/keepalived
+
   backend:
     image: ${LAB_BACKEND_IMAGE:?}
     build:
@@ -52,6 +71,7 @@ services:
     environment:
       LAB_A: ${LAB_A:?}
       LAB_B: ${LAB_B:?}
+      LAB_SINGLE: ${LAB_SINGLE:?}
       LAB_BACKEND: ${LAB_BACKEND:?}
       LAB_VIP: ${LAB_VIP:?}
       LAB_VIP_2: ${LAB_VIP_2:?}
@@ -81,3 +101,7 @@ volumes:
   b-acme:
   b-haproxy:
   b-keepalived:
+  single-data:
+  single-acme:
+  single-haproxy:
+  single-keepalived:

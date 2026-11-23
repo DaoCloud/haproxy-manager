@@ -38,11 +38,11 @@ HAProxy，并使用 Keepalived 实现共享虚拟 IP（VIP）和节点故障切�
 ## 单节点生产部署（无 VIP）
 
 如果只需要在单台 Linux 主机上做 TCP 四层转发，不依赖 VIP 漂移、VRRP 或 Keepalived，
-可以直接使用主机当前业务网卡上已有的固定 IPv4 地址部署单节点容器。
+可以直接部署单节点容器：默认在 `0.0.0.0` 上监听转发端口，也可按需通过
+`--proxy-interface`（HAProxy 数据面网卡）或 `--proxy-ip`（HAProxy 数据面固定 IP）限定转发监听范围。
 
-按[单节点生产部署：本机接口 IP 四层转发（无 VIP）](docs/deploy-single-node-docker.md)运行
-`tools/deploy-single-node-docker.sh`，指定网卡（单 IP 网卡可自动识别地址，多 IP 网卡可通过
-`--listen-ip` 指定）和转发规则，生成 `config.json` 并启动容器。
+按[单节点生产部署：无 VIP 四层转发](docs/deploy-single-node-docker.md)运行
+`tools/deploy-single-node-docker.sh`，指定管理员密码和转发规则，即可生成 `config.json` 并启动容器。
 
 单节点部署以 `standalone` 模式运行，不启动 Keepalived，不修改宿主机 `ip_nonlocal_bind`，
 容器也不附加 `NET_ADMIN`/`NET_BROADCAST`/`NET_RAW` 权限，适用于不支持 VIP/VRRP 的单机或受限网络环境。

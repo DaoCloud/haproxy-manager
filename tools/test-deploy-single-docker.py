@@ -41,7 +41,7 @@ class SingleNodeDeploymentTests(unittest.TestCase):
             {"ifname": "ens192", "operstate": "UP", "addr_info": [{"local": "10.40.0.11"}]},
         ])
         self.args = [
-            "--interface", "ens192",
+            "--proxy-interface", "ens192",
             "--admin-password", self.password,
             "--data-dir", str(self.data),
             "--tcp-forward", "web", "18080", "10.60.0.20", "28080",
@@ -126,7 +126,154 @@ class SingleNodeDeploymentTests(unittest.TestCase):
         self.assertIn("does not confirm startup Apply", result.stdout)
         self.assertEqual(list(self.stage.iterdir()), [])
 
-    def test_multi_ip_interface_requires_explicit_listen_ip_and_supports_multiple_ips(self):
+    def test_defaults_to_wildcard_0_0_0_0_without_interface_or_ip(self):
+        args = [
+            "--admin-password", self.password,
+            "--data-dir", str(self.data),
+            "--tcp-forward", "web", "18080", "10.60.0.20", "28080",
+            "--tcp-forward", "tls", "0.0.0.0:18443", "10.60.0.21", "28443",
+        ]
+        result = self.invoke(args=args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        raw = json.loads((self.data / "manager/config.json").read_text())
+        self.assertEqual(raw["local"]["node_url"], "")
+        self.assertEqual(raw["local"]["keepalived"], {"enabled": False, "interface": ""})
+        self.assertEqual([f["binds"] for f in raw["haproxy"]["frontends"]],
+                         ["0.0.0.0:18080", "0.0.0.0:18443"])
+        self.assertIn("http://127.0.0.1:8080/api/status?brief=1", result.stdout)
+        # Pure wildcard mode does not need to inspect host interfaces.
+        self.assertFalse(any(c[0] == "ip" for c in self.commands()))
+
+        CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONF_PATH.write_text(json.dumps(raw))
+        cfg = load_config()
+        check_file_config(cfg)
+        rendered = haproxy.render_haproxy(cfg)
+        self.assertTrue("bind 0.0.0.0:18080" in rendered or "bind :::18080 v4v6" in rendered)
+        self.assertTrue("bind 0.0.0.0:18443" in rendered or "bind :::18443 v4v6" in rendered)
+
+        for path in (apply.HAPROXY_CFG, apply.KEEPALIVED_CFG):
+            path.unlink(missing_ok=True)
+        with patch.object(startup, "ENABLED", True), \
+             patch.object(startup, "_status", {
+                 "enabled": True, "state": "checking",
+                 "local_ok": False, "error": "", "attempts": 0}), \
+             patch.object(startup, "_join_baseline", None), \
+             patch.object(apply, "run", return_value=(0, "active")), \
+             patch.object(apply, "_haproxy_check", return_value=(0, "", "global\n")), \
+             patch.object(apply, "_haproxy_not_serving", return_value=""), \
+             patch.object(apply, "check_rendered", return_value=(True, "")):
+            startup.attempt()
+            self.assertTrue(apply.HAPROXY_CFG.exists())
+            self.assertFalse(apply.KEEPALIVED_CFG.exists())
+            self.assertEqual(startup._status["state"], "ready")
+            self.assertTrue(startup._status["local_ok"])
+
+        # Mixed wildcard and specific host IP on different ports succeeds; same port fails closed.
+        mixed_dir = self.root / "data-mixed"
+        mixed = self.invoke(args=[
+            "--admin-password", self.password,
+            "--data-dir", str(mixed_dir),
+            "--tcp-forward", "web", "18080", "10.60.0.20", "28080",
+            "--tcp-forward", "tls", "10.40.0.11:18443", "10.60.0.21", "28443",
+        ])
+        self.assertEqual(mixed.returncode, 0, mixed.stderr)
+        mixed_raw = json.loads((mixed_dir / "manager/config.json").read_text())
+        self.assertEqual([f["binds"] for f in mixed_raw["haproxy"]["frontends"]],
+                         ["0.0.0.0:18080", "10.40.0.11:18443"])
+
+        explicit_only_dir = self.root / "data-explicit-only"
+        explicit_only = self.invoke(args=[
+            "--admin-password", self.password,
+            "--data-dir", str(explicit_only_dir),
+            "--tcp-forward", "tls", "10.40.0.11:18443", "10.60.0.21", "28443",
+        ])
+        self.assertEqual(explicit_only.returncode, 0, explicit_only.stderr)
+        self.assertIn("proxy_ips=10.40.0.11 ", explicit_only.stdout)
+        self.assertNotIn("proxy_ips=0.0.0.0", explicit_only.stdout)
+
+        conflict_dir = self.root / "data-conflict"
+        conflict = self.invoke(args=[
+            "--admin-password", self.password,
+            "--data-dir", str(conflict_dir),
+            "--tcp-forward", "web", "18080", "10.60.0.20", "28080",
+            "--tcp-forward", "dup", "10.40.0.11:18080", "10.60.0.21", "28443",
+        ])
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("conflicts with wildcard listener 0.0.0.0:18080", conflict.stderr)
+        self.assertFalse(conflict_dir.exists())
+
+        reverse_conflict_dir = self.root / "data-reverse-conflict"
+        reverse_conflict = self.invoke(args=[
+            "--admin-password", self.password,
+            "--data-dir", str(reverse_conflict_dir),
+            "--tcp-forward", "web", "10.40.0.11:18080", "10.60.0.20", "28080",
+            "--tcp-forward", "dup", "18080", "10.60.0.21", "28443",
+        ])
+        self.assertNotEqual(reverse_conflict.returncode, 0)
+        self.assertIn("conflicts with a specific IP listener on port 18080", reverse_conflict.stderr)
+        self.assertFalse(reverse_conflict_dir.exists())
+
+    def test_proxy_ip_without_proxy_interface(self):
+        args = [
+            "--proxy-ip", "10.40.0.11",
+            "--admin-password", self.password,
+            "--data-dir", str(self.data),
+            "--tcp-forward", "app", "443", "10.60.0.20", "8443",
+        ]
+        res = self.invoke(args=args)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        raw = json.loads((self.data / "manager/config.json").read_text())
+        self.assertEqual(raw["local"]["keepalived"], {"enabled": False, "interface": ""})
+        self.assertEqual(raw["local"]["node_url"], "http://10.40.0.11:8080")
+        self.assertEqual(raw["haproxy"]["frontends"][0]["binds"], "10.40.0.11:443")
+
+        # When 0.0.0.0 precedes a specific --proxy-ip, default mng_ip picks the first non-wildcard IP.
+        mixed_dir = self.root / "data-wildcard-first"
+        mixed = self.invoke(args=[
+            "--proxy-ip", "0.0.0.0",
+            "--proxy-ip", "10.40.0.11",
+            "--admin-password", self.password,
+            "--data-dir", str(mixed_dir),
+            "--tcp-forward", "web", "0.0.0.0:18080", "10.60.0.20", "28080",
+            "--tcp-forward", "tls", "10.40.0.11:18443", "10.60.0.21", "28443",
+        ])
+        self.assertEqual(mixed.returncode, 0, mixed.stderr)
+        mixed_raw = json.loads((mixed_dir / "manager/config.json").read_text())
+        self.assertEqual(mixed_raw["local"]["node_url"], "http://10.40.0.11:8080")
+        self.assertIn("http://10.40.0.11:8080/api/status?brief=1", mixed.stdout)
+
+        bad_dir = self.root / "data-bad-ip"
+        bad = self.invoke(args=[
+            "--proxy-ip", "10.40.0.99",
+            "--admin-password", self.password,
+            "--data-dir", str(bad_dir),
+            "--tcp-forward", "app", "443", "10.60.0.20", "8443",
+        ])
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("must belong to a non-loopback interface (not DOWN)", bad.stderr)
+        self.assertFalse(bad_dir.exists())
+
+        down_dir = self.root / "data-down-ip"
+        down = self.invoke(
+            args=[
+                "--proxy-ip", "10.40.0.11",
+                "--admin-password", self.password,
+                "--data-dir", str(down_dir),
+                "--tcp-forward", "app", "443", "10.60.0.20", "8443",
+            ],
+            env={
+                "TEST_ADDRESSES": json.dumps([
+                    {"ifname": "ens192", "operstate": "DOWN", "addr_info": [{"local": "10.40.0.11"}]}
+                ])
+            },
+        )
+        self.assertNotEqual(down.returncode, 0)
+        self.assertIn("not DOWN", down.stderr)
+        self.assertFalse(down_dir.exists())
+
+    def test_multi_ip_interface_requires_explicit_proxy_ip_and_supports_multiple_ips(self):
         multi_env = {
             "TEST_ADDRESSES": json.dumps([
                 {"ifname": "mgmt0", "operstate": "UP", "addr_info": [{"local": "172.20.0.11"}]},
@@ -134,18 +281,18 @@ class SingleNodeDeploymentTests(unittest.TestCase):
                     {"local": "10.40.0.11"}, {"local": "10.40.0.12"}]},
             ])
         }
-        # Ambiguous interface without --listen-ip fails closed and lists candidates.
+        # Ambiguous interface without --proxy-ip fails closed and lists candidates.
         res = self.invoke(env=multi_env)
         self.assert_no_changes(res)
         self.assertIn("multiple IPv4 addresses", res.stderr)
         self.assertIn("10.40.0.11", res.stderr)
         self.assertIn("10.40.0.12", res.stderr)
 
-        # Explicit multiple --listen-ip + separate --mng-ip + custom --mng-port + supplied --api-key.
+        # Explicit multiple --proxy-ip + separate --mng-ip + custom --mng-port + supplied --api-key.
         args = [
-            "--interface", "ens192",
-            "--listen-ip", "10.40.0.11",
-            "--listen-ip", "10.40.0.12",
+            "--proxy-interface", "ens192",
+            "--proxy-ip", "10.40.0.11",
+            "--proxy-ip", "10.40.0.12",
             "--mng-ip", "172.20.0.11",
             "--mng-port", "18090",
             "--api-key", self.api_key,
@@ -214,7 +361,7 @@ class SingleNodeDeploymentTests(unittest.TestCase):
 
     def test_explicit_ip_port_on_auto_detected_single_ip_interface(self):
         args = [
-            "--interface", "ens192",
+            "--proxy-interface", "ens192",
             "--admin-password", self.password,
             "--data-dir", str(self.data),
             "--tcp-forward", "app", "10.40.0.11:443", "10.60.0.20", "8443",
@@ -230,23 +377,25 @@ class SingleNodeDeploymentTests(unittest.TestCase):
         bad[bad.index(str(self.data))] = str(clean_data)
         res = self.invoke(args=bad)
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("must match the selected interface IP", res.stderr)
+        self.assertIn("must match the selected proxy IP", res.stderr)
         self.assertIn("10.40.0.99", res.stderr)
         self.assertFalse(clean_data.exists())
 
     def test_help_requires_no_root_or_host_operations(self):
         result = self.invoke(args=["--help"], env={"TEST_UID": "1000"})
         self.assertEqual(result.returncode, 0)
-        self.assertIn("--interface", result.stdout)
-        self.assertIn("--listen-ip", result.stdout)
+        self.assertIn("--proxy-interface", result.stdout)
+        self.assertIn("--proxy-ip", result.stdout)
+        self.assertIn("0.0.0.0", result.stdout)
         self.assertEqual(self.commands(), [])
 
     def test_invalid_arguments_and_conflicts_fail_before_host_changes(self):
         cases = [
-            ["--interface", "lo"],
-            ["--listen-ip", "999.1.1.1"],
-            ["--listen-ip", "10.40.0.11", "--listen-ip", "10.40.0.11"],
-            ["--listen-ip", "10.40.0.99"],
+            ["--proxy-interface", "lo"],
+            ["--proxy-ip", "999.1.1.1"],
+            ["--proxy-ip", "10.40.0.11", "--proxy-ip", "10.40.0.11"],
+            ["--proxy-ip", "10.40.0.99"],
+            ["--mng-ip", "0.0.0.0"],
             ["--mng-ip", "10.40.0.99"],
             ["--mng-port", "0"],
             ["--mng-port", "65536"],
@@ -267,7 +416,7 @@ class SingleNodeDeploymentTests(unittest.TestCase):
                 self.assert_no_changes(self.invoke(extra))
         self.assert_no_changes(self.invoke(args=[]))
 
-        # Multiple --listen-ip requires explicit IP:PORT on every rule.
+        # Multiple --proxy-ip requires explicit IP:PORT on every rule.
         multi_env = {
             "TEST_ADDRESSES": json.dumps([
                 {"ifname": "ens192", "operstate": "UP", "addr_info": [
@@ -275,7 +424,7 @@ class SingleNodeDeploymentTests(unittest.TestCase):
             ])
         }
         self.assert_no_changes(self.invoke(
-            ["--listen-ip", "10.40.0.11", "--listen-ip", "10.40.0.12"],
+            ["--proxy-ip", "10.40.0.11", "--proxy-ip", "10.40.0.12"],
             env=multi_env,
         ))
 

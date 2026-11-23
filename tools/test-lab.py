@@ -85,7 +85,8 @@ class LabImageTests(unittest.TestCase):
     def test_test_scenarios_prepare_selected_images_before_starting(self):
         os.environ["HAM_LAB_IMAGE"] = "ghcr.io/daocloud/haproxy-manager:V1.0.0"
         lab = Lab(testing=True)
-        for scenario in (lab.test_tcp_deployment, lab.test_startup):
+        for scenario in (lab.test_single_node_deployment, lab.test_tcp_deployment,
+                         lab.test_startup):
             with self.subTest(scenario=scenario.__name__), \
                     patch.object(lab, "compose", side_effect=RuntimeError("stop before startup")):
                 self.command.reset_mock()

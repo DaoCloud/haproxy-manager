@@ -1,7 +1,8 @@
-# 单节点生产部署：本机接口 IP 四层转发（无 VIP）
+# 单节点生产部署：无 VIP 四层转发
 
-在单台 Linux 主机上运行一个包含 manager 和 HAProxy 的容器，使用宿主机网络，
-直接监听宿主机指定网卡上已有的 IPv4 地址对接不同的 TCP 服务。
+在单台 Linux 主机上运行一个包含 manager 和 HAProxy 的容器，使用宿主机网络。
+默认直接监听 `0.0.0.0:<端口>`（宿主机启用 IPv6 时会自动渲染为 `:::<端口> v4v6` 双栈监听），
+也可以按需通过 `--proxy-interface`（HAProxy 转发数据面网卡）或 `--proxy-ip`（HAProxy 转发数据面固定 IPv4）限定监听地址。
 不配置 VIP，不启用 Keepalived 和 VRRP，不需要改写宿主机 `sysctl`，也不需要额外的 `NET_*` 容器权限。
 
 HAProxy 只做 TCP passthrough，不终止业务 TLS，也不根据 URL path 分流。
@@ -14,17 +15,20 @@ HAProxy 只做 TCP passthrough，不终止业务 TLS，也不根据 URL path 分
 
 | 对象 | 示例 |
 |---|---|
-| 代理节点接口与固定 IPv4 | `eth0` / `10.20.0.11` |
+| 代理节点数据面接口与 IPv4（可选） | `eth0` / `10.20.0.11`（不指定则默认监听 `0.0.0.0`） |
 | 管理端口 | `8080`（可通过 `--mng-port` 修改） |
 | app backend | `10.30.0.20:8443`，HTTPS |
 | monitor backend | `10.30.0.21:9443`，HTTPS |
 
-宿主机需要 rootful Docker、Bash（4+）、curl、jq 和 iproute2。宿主机命令以 root 执行。
+宿主机需要 rootful Docker、Bash（4+）、curl 和 jq；使用 `--proxy-interface`、`--proxy-ip`、`--mng-ip`
+或在规则中指定本机固定 IP 时还需要 `iproute2`。宿主机命令以 root 执行。
 本方案不需要在代理主机准备业务证书、私钥或 OpenSSL，也不需要网络支持 VIP 漂移、ARP 更新或 VRRP（IP 协议 112）。
 
-- 业务接口（`--interface`）上的 IPv4 必须是**固定地址**。若使用 DHCP 导致地址变化，
-  容器重启后 HAProxy 会因无法绑定原地址而失败。
-- 客户端需要能访问代理节点的监听 `IP:端口`，网络需要允许相应 TCP 端口并保证回程可达；
+- 若省略 `--proxy-interface` 与 `--proxy-ip`，转发端口会监听在 `0.0.0.0` 上（宿主机所有接口可达），
+  请结合宿主机防火墙按需限制来源访问；主机变更 IP 时无需改动转发监听配置。
+- 若通过 `--proxy-interface` 或 `--proxy-ip` 绑定具体 IPv4，该地址应为**固定地址**；
+  若使用 DHCP 导致地址变化，容器重启后 HAProxy 会因无法绑定原地址而失败。
+- 客户端需要能访问代理节点的监听地址与端口，网络需要允许相应 TCP 端口并保证回程可达；
   代理节点需要能访问全部 backend。
 - 管理端口默认 TCP 8080，可通过 `--mng-port` 修改。
   该端口只允许授权管理主机访问，不要暴露到公网或普通业务网段。
@@ -32,8 +36,8 @@ HAProxy 只做 TCP passthrough，不终止业务 TLS，也不根据 URL path 分
   跨不可信网络时先建立经过认证的加密通道。
 - 宿主机不能有其他服务占用相同的监听 `IP:端口` 或 `0.0.0.0:端口`（包括管理端口）。
 
-在主机执行 `ip -br -4 addr`，确认承载流量的接口名称及其固定 IPv4 地址。
-HAProxy 按规则里的 `IP:端口` 监听；默认由 HAProxy 新建到 backend 的 TCP 连接，
+如需限定特定数据面网卡或 IP，可在主机执行 `ip -br -4 addr` 确认接口名称及其 IPv4 地址。
+HAProxy 按规则里的监听地址与端口接收连接；默认由 HAProxy 新建到 backend 的 TCP 连接，
 backend 看到的源地址通常是代理节点的出站地址，而不是客户端地址。
 
 建议提前拉取镜像并查询 digest，生产环境可将 `--image` 固定为 `ghcr.io/daocloud/haproxy-manager@sha256:...`：
@@ -63,14 +67,13 @@ docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/daocloud/haprox
 ADMIN_PASSWORD='K0Xpv!cc!!t#amhI'
 ```
 
-### 常见用法：网卡只有一个 IPv4 地址
+### 方式一：最简部署（默认监听 `0.0.0.0`）
 
-当 `--interface` 指定的网卡上只有一个 IPv4 地址时，无需填写 `--listen-ip`，
-脚本会自动获取该接口的 IPv4 地址，`--tcp-forward` 可直接简写端口：
+不指定 `--proxy-interface` 和 `--proxy-ip` 时，转发规则直接写端口号即默认监听 `0.0.0.0:<端口>`
+（也可在单条 `--tcp-forward` 中显式写 `0.0.0.0:PORT` 或本机已有固定 `IP:PORT`）：
 
 ```bash
 bash tools/deploy-single-node-docker.sh \
-  --interface eth0 \
   --mng-port 8080 \
   --admin-password "$ADMIN_PASSWORD" \
   --image ghcr.io/daocloud/haproxy-manager:latest \
@@ -78,7 +81,7 @@ bash tools/deploy-single-node-docker.sh \
   --tcp-forward monitor 8443 10.30.0.21 9443
 ```
 
-部署后的映射（假设 `eth0` 的 IPv4 为 `10.20.0.11`）：
+部署后的映射（监听宿主机所有接口，假设主机 IP 为 `10.20.0.11`）：
 
 | 客户端访问 | backend 连接目标 |
 |---|---|
@@ -87,18 +90,19 @@ bash tools/deploy-single-node-docker.sh \
 
 管理 UI 通过 `http://10.20.0.11:8080` 访问。
 
-### 多 IP 网卡或管理/业务分网卡
+### 方式二：绑定指定数据面网卡或 IP（可选）
 
-当 `--interface` 上配置了多个 IPv4 地址（例如主 IP + 辅助 IP）时，脚本不会猜测监听地址，
-需要通过 `--listen-ip` 显式指定一个或多个该接口上的 IPv4。
-多个 `--listen-ip` 时，每条 `--tcp-forward` 必须明确填写 `IP:端口`；
-若管理网卡与业务网卡分离，可额外指定 `--mng-ip`：
+如果希望 HAProxy 转发流量只绑定到特定数据面网卡或固定 IPv4，可通过 `--proxy-interface` 和/或 `--proxy-ip` 指定：
+
+- **仅传 `--proxy-interface eth0`**：当 `eth0` 上只有一个 IPv4 时自动识别该 IP，`--tcp-forward` 可简写 `PORT`。
+- **仅传 `--proxy-ip 10.20.0.11`**：无需填网卡名，脚本校验该 IP 属于本机非 loopback 网卡即可。
+- **多 IP 网卡或管理/业务分网卡**：通过重复 `--proxy-ip` 显式列出数据面转发 IP（此时每条 `--tcp-forward` 须填 `IP:PORT`），需要时可额外用 `--mng-ip` 标注管理面地址：
 
 ```bash
 bash tools/deploy-single-node-docker.sh \
-  --interface eth0 \
-  --listen-ip 10.20.0.11 \
-  --listen-ip 10.20.0.12 \
+  --proxy-interface eth0 \
+  --proxy-ip 10.20.0.11 \
+  --proxy-ip 10.20.0.12 \
   --mng-ip 172.20.0.11 \
   --mng-port 8080 \
   --admin-password "$ADMIN_PASSWORD" \
@@ -121,12 +125,12 @@ TCP passthrough 不改写 HTTP Host、重定向、Cookie 或路径前缀，也�
 
 | 参数 | 要求与默认值 |
 |---|---|
-| `--interface NAME` | 必填，宿主机承载流量的非 loopback 网卡名（需存在且非 `DOWN`） |
-| `--listen-ip IPV4` | 可选，可重复；须为 `--interface` 上已存在的固定 IPv4。网卡仅有一个 IPv4 时可省略 |
-| `--mng-ip IPV4` | 可选，默认取第一个监听 IP；须属于本机非 loopback 网卡，用于 `local.node_url` 和提示输出，不限制 UI 监听地址 |
-| `--mng-port PORT` | 默认 `8080`，范围 1–65535，UI/API 端口，保留不可用于转发规则 |
-| `--admin-password` | 必填，UI 初始密码，至少 16 位、单行 |
-| `--tcp-forward NAME [IP:]PORT BACKEND_ADDRESS BACKEND_PORT` | 至少一条，可重复；单监听 IP 可简写 `PORT`，多监听 IP 须填 `IP:PORT`；backend 接受 IPv4 或可解析的 DNS 名 |
+| `--admin-password` | 必填，管理面 UI 初始密码，至少 16 位、单行 |
+| `--tcp-forward NAME [IP:]PORT BACKEND_ADDRESS BACKEND_PORT` | 必填，至少一条，可重复；省略 `--proxy-interface`/`--proxy-ip` 时写 `PORT` 默认绑定 `0.0.0.0:PORT`（也可显式写 `IP:PORT`）；单转发 IP 可简写 `PORT`，多 `--proxy-ip` 须填 `IP:PORT`；backend 接受 IPv4 或可解析的 DNS 名 |
+| `--proxy-interface NAME` | 可选，HAProxy 转发数据面使用的宿主机非 loopback 网卡（需存在且非 `DOWN`）；单 IP 网卡自动识别该 IP，多 IP 网卡须配合 `--proxy-ip`；省略时默认监听 `0.0.0.0` |
+| `--proxy-ip IPV4` | 可选，HAProxy 转发数据面绑定的固定 IPv4，可重复；可单独使用（校验属于本机非 loopback 网卡），也可配合 `--proxy-interface` 使用（校验属于该网卡） |
+| `--mng-ip IPV4` | 可选，管理面 IPv4，用于写入 `local.node_url` 和状态验证提示（未指定时，若有非通配转发 IP 则默认取首个转发 IP；默认 `0.0.0.0` 模式则 `node_url` 留空） |
+| `--mng-port PORT` | 默认 `8080`，范围 1–65535，管理面 UI/API 端口，保留不可用于转发规则 |
 | `--api-key KEY` | 可选，至少 32 个无空白可见 ASCII 字符；省略时自动生成并保存到 `data/api-header` |
 | `--admin-user NAME` | 默认 `admin` |
 | `--image REFERENCE` | 默认 `ghcr.io/daocloud/haproxy-manager:latest`，生产建议固定 digest |
