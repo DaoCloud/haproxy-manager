@@ -35,6 +35,19 @@ HAProxy，并使用 Keepalived 实现共享虚拟 IP（VIP）和节点故障切�
 容器健康检查只报告 manager 是否响应，不能自动重启卡死的 manager，
 生产环境需要额外的监测和恢复机制。VIP 故障切换不保证已有 TCP 会话不中断。
 
+## 单节点生产部署（无 VIP）
+
+如果只需要在单台 Linux 主机上做 TCP 四层转发，不依赖 VIP 漂移、VRRP 或 Keepalived，
+可以直接部署单节点容器：默认在 `0.0.0.0` 上监听转发端口，也可按需通过
+`--proxy-interface`（HAProxy 数据面网卡）或 `--proxy-ip`（HAProxy 数据面固定 IP）限定转发监听范围。
+
+按[单节点生产部署：无 VIP 四层转发](docs/deploy-single-node-docker.md)运行
+`tools/deploy-single-node-docker.sh`，指定管理员密码和转发规则，即可生成 `config.json` 并启动容器。
+
+单节点部署以 `standalone` 模式运行，不启动 Keepalived，不修改宿主机 `ip_nonlocal_bind`，
+容器也不附加 `NET_ADMIN`/`NET_BROADCAST`/`NET_RAW` 权限，适用于不支持 VIP/VRRP 的单机或受限网络环境。
+管理端口（默认 8080）同样仅允许授权管理主机访问，不要暴露到公网。
+
 ## 本地双节点实验环境
 
 在一台 Linux 宿主机上准备 rootful Docker、Docker Compose v2、Python 3 和 `iproute2`，

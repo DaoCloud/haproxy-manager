@@ -43,7 +43,9 @@ if __name__ == "__main__":
             certificate = root / (service + ".crt")
             key = root / (service + ".key")
             sans = "DNS:backend.lab.test," + ",".join(
-                "IP:" + os.environ[name] for name in ("LAB_BACKEND", "LAB_VIP", "LAB_VIP_2"))
+                "IP:" + os.environ[name]
+                for name in ("LAB_BACKEND", "LAB_VIP", "LAB_VIP_2", "LAB_SINGLE")
+                if os.environ.get(name))
             subprocess.run([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
                 "-subj", "/CN=" + service, "-addext", "subjectAltName=" + sans,

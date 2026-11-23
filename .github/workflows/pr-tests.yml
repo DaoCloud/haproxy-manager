@@ -58,7 +58,7 @@ jobs:
           node tools/uitests/sync-results.mjs
 
   integration:
-    name: Dual-node integration
+    name: Integration tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -71,5 +71,5 @@ jobs:
         with:
           python-version: "3.13"
       - uses: docker/setup-buildx-action@v3
-      - name: Test real HAProxy and Keepalived nodes
+      - name: Test real HAProxy and Keepalived nodes (single and dual node)
         run: python tools/integration/lab.py test

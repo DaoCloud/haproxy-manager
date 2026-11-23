@@ -313,48 +313,103 @@ def owns_tcp_vips(client):
             set(status["vip_held"]) == {os.environ["LAB_VIP"], os.environ["LAB_VIP_2"]})
 
 
-def check_tcp_deployment():
+def check_tcp_tls_endpoint(address, port, service, certificate_path):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open("http://%s:8080%s" % (
+            os.environ["LAB_BACKEND"], certificate_path), timeout=5) as response:
+        certificate = response.read().decode()
+    context = ssl.create_default_context(cadata=certificate)
+    connection = http.client.HTTPSConnection(address, port, context=context, timeout=5)
+    try:
+        connection.connect()
+        require(connection.sock.getpeercert(binary_form=True) ==
+                ssl.PEM_cert_to_DER_cert(certificate),
+                "TCP passthrough changed the backend certificate")
+        path = "/echo?next=%2Flogin&key=kept"
+        connection.request("GET", path)
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        host = address if port == 443 else "%s:%s" % (address, port)
+        require(response.status == 200 and result == {
+            "service": service, "protocol": "https", "path": path, "host": host},
+            "VIP:port selected the wrong backend or changed the request: %s" % result)
+        connection.request("GET", "/redirect")
+        response = connection.getresponse()
+        location = response.getheader("Location")
+        require(response.status == 302 and location == "/login" and
+                response.getheader("Set-Cookie") == "session=fixture; Path=/; HttpOnly",
+                "TCP passthrough changed a redirect or cookie")
+        response.read()
+        connection.request("GET", location)
+        response = connection.getresponse()
+        require(response.status == 200 and json.loads(response.read()) == {
+            "service": service, "protocol": "https"},
+            "a root-path redirect did not stay on its own backend")
+    finally:
+        connection.close()
+
+
+def check_tcp_deployment():
     for address, port, service, certificate_path in (
             (os.environ["LAB_VIP"], 443, "lab-backend", "/certificate"),
             (os.environ["LAB_VIP_2"], 443, "lab-monitor", "/monitor-certificate"),
             (os.environ["LAB_VIP_2"], 8443, "lab-backend", "/certificate")):
-        with opener.open("http://%s:8080%s" % (
-                os.environ["LAB_BACKEND"], certificate_path), timeout=5) as response:
-            certificate = response.read().decode()
-        context = ssl.create_default_context(cadata=certificate)
-        connection = http.client.HTTPSConnection(address, port, context=context, timeout=5)
-        try:
-            connection.connect()
-            require(connection.sock.getpeercert(binary_form=True) ==
-                    ssl.PEM_cert_to_DER_cert(certificate),
-                    "TCP passthrough changed the backend certificate")
-            path = "/echo?next=%2Flogin&key=kept"
-            connection.request("GET", path)
-            response = connection.getresponse()
-            result = json.loads(response.read())
-            host = address if port == 443 else "%s:%s" % (address, port)
-            require(response.status == 200 and result == {
-                "service": service, "protocol": "https", "path": path, "host": host},
-                "VIP:port selected the wrong backend or changed the request: %s" % result)
-            connection.request("GET", "/redirect")
-            response = connection.getresponse()
-            location = response.getheader("Location")
-            require(response.status == 302 and location == "/login" and
-                    response.getheader("Set-Cookie") == "session=fixture; Path=/; HttpOnly",
-                    "TCP passthrough changed a redirect or cookie")
-            response.read()
-            connection.request("GET", location)
-            response = connection.getresponse()
-            require(response.status == 200 and json.loads(response.read()) == {
-                "service": service, "protocol": "https"},
-                "a root-path redirect did not stay on its own backend")
-        finally:
-            connection.close()
+        check_tcp_tls_endpoint(address, port, service, certificate_path)
     http_body(os.environ["LAB_VIP"])
     print("PASS: multiple VIPs share ports and keep backend TLS, paths, redirects and cookies intact.",
           flush=True)
     return True
+
+
+def check_single_node_deployment():
+    single = os.environ["LAB_SINGLE"]
+    client = Client(single).login()
+
+    def ready():
+        status = client.call("status")
+        require(status["startup"]["state"] == "ready",
+                "single-node startup state is %s (%s)" % (
+                    status["startup"]["state"], status["startup"].get("error")))
+        require(status["role"] == "standalone",
+                "expected standalone role, got %s" % status["role"])
+        require(status["keepalived"] == "disabled",
+                "expected keepalived disabled, got %s" % status["keepalived"])
+        require(status["haproxy"] == "active",
+                "expected haproxy active, got %s" % status["haproxy"])
+        require(not status["vips"] and not status["vip_held"],
+                "standalone node should not configure or hold VIPs: %s / %s" % (
+                    status["vips"], status["vip_held"]))
+        require(status["published_fp"] and
+                (status["applied_rev"], status["applied_fp"]) ==
+                (status["published_rev"], status["published_fp"]) and
+                not status["apply_error"],
+                "standalone node did not apply its config: %s" % status)
+        require(client.call("setup/state")["complete"],
+                "standalone startup did not complete setup")
+        return True
+
+    wait_for("standalone single-node readiness", ready)
+    wait_for("single-node HTTP forwarding", lambda: http_body(single, 80))
+    for port, service, certificate_path in (
+            (443, "lab-backend", "/certificate"),
+            (8443, "lab-monitor", "/monitor-certificate")):
+        wait_for("single-node TLS passthrough on port %d" % port,
+                 lambda p=port, s=service, c=certificate_path: (
+                     check_tcp_tls_endpoint(single, p, s, c) or True))
+    print("PASS: standalone node runs without VIP/Keepalived and forwards HTTP and TLS passthrough.",
+          flush=True)
+    return True
+
+
+def test_single_node_apply():
+    single = os.environ["LAB_SINGLE"]
+    client = Client(single).login()
+    publish(client, "single-probe", 18092, apply=True)
+    wait_for("single-node live rule forwarding", lambda: http_body(single, 18092))
+    delete_service(client, 18092)
+    client.call("apply", {})
+    wait_for("single-node deleted rule removal", lambda: absent(single, 18092))
+    print("PASS: standalone node applies live rule creation and deletion.", flush=True)
 
 
 def internal(action, node=None):
@@ -376,6 +431,10 @@ def internal(action, node=None):
         wait_for("TCP startup publication", lambda: agreement(nodes))
         wait_for("all VIPs on one ready node", lambda: any(owns_tcp_vips(c) for c in nodes.values()))
         wait_for("multi-VIP TCP forwarding", check_tcp_deployment)
+    elif action == "_single_check":
+        check_single_node_deployment()
+    elif action == "_single_apply":
+        test_single_node_apply()
     elif action == "_tcp_offline":
         survivor = "proxy-b" if node == "proxy-a" else "proxy-a"
         client = Client(os.environ["LAB_B" if survivor == "proxy-b" else "LAB_A"]).login()
@@ -570,8 +629,8 @@ class Lab:
             subnet = self.free_subnet()
         require(subnet.version == 4 and subnet.prefixlen == 24, "the lab needs an IPv4 /24 subnet")
         self.env.update(LAB_SUBNET=str(subnet), LAB_A=str(subnet[11]), LAB_B=str(subnet[12]),
-                        LAB_BACKEND=str(subnet[20]), LAB_VIP=str(subnet[100]),
-                        LAB_VIP_2=str(subnet[101]))
+                        LAB_SINGLE=str(subnet[13]), LAB_BACKEND=str(subnet[20]),
+                        LAB_VIP=str(subnet[100]), LAB_VIP_2=str(subnet[101]))
 
     def command(self, args, capture=False):
         result = subprocess.run(args, cwd=ROOT, env=self.env, check=True, text=True,
@@ -624,11 +683,53 @@ class Lab:
                   "p.parent.mkdir(parents=True,exist_ok=True); "
                   "assert not p.exists(), 'refusing to overwrite an existing deployment'; "
                   "p.write_text(json.dumps(json.load(sys.stdin))); p.chmod(0o600)")
+        profile = ["--profile", "single"] if node == "proxy-single" else []
         subprocess.run(["docker", "compose", "-p", self.project, "-f",
-                        str(ROOT / "tools/integration/compose.yml"),
+                        str(ROOT / "tools/integration/compose.yml"), *profile,
                         "run", "--rm", "--no-deps", "-T", "--entrypoint", "python3",
                         node, "-c", script], cwd=ROOT, env=self.env, check=True,
                        input=json.dumps(config), text=True)
+
+    def test_single_node_deployment(self):
+        from deploy_fixture import DeploymentFixture
+
+        self.prepare_images()
+        self.compose("up", "-d", "--no-build", "--wait", "backend")
+        with tempfile.TemporaryDirectory(prefix="ham-single-deploy-") as directory:
+            owned = Path(directory) / "proxy-single"
+            owned.mkdir()
+            fixture = DeploymentFixture(owned)
+            args = [
+                "--admin-password", PASSWORD,
+                "--api-key", self.project + "-single",
+                "--data-dir", str(fixture.data),
+                "--tcp-forward", "web", "80", self.env["LAB_BACKEND"], "8080",
+                "--tcp-forward", "app", "443", self.env["LAB_BACKEND"], "8443",
+                "--tcp-forward", "monitor", self.env["LAB_SINGLE"] + ":8443",
+                self.env["LAB_BACKEND"], "9443",
+            ]
+            result = fixture.run(args, {
+                "TEST_HOSTNAME": "proxy-single",
+                "TEST_ADDRESSES": json.dumps([{
+                    "ifname": "eth0", "operstate": "UP",
+                    "addr_info": [{"local": self.env["LAB_SINGLE"]}]}]),
+            }, script="deploy-single-node-docker.sh")
+            require(result.returncode == 0,
+                    "single-node deployment script failed: %s" % result.stderr)
+            require(not list((fixture.data / "haproxy").iterdir()),
+                    "single-node TCP deployment unexpectedly prepared proxy certificates")
+            require(not (owned / "installed-sysctl.conf").exists(),
+                    "single-node deployment unexpectedly modified host sysctl")
+            config = json.loads((fixture.data / "manager/config.json").read_text())
+            self.write_config("proxy-single", config)
+        self.compose("--profile", "single", "up", "-d", "--no-build", "proxy-single")
+        self.phase("_single_check")
+        self.phase("_single_apply")
+        self.compose("--profile", "single", "restart", "proxy-single")
+        self.phase("_single_check")
+        print("PASS: real single-node standalone deployment forwards HTTP/TLS, applies live changes, and survives restart.",
+              flush=True)
+        self.compose("--profile", "single", "down", "--volumes")
 
     def test_tcp_deployment(self):
         from deploy_fixture import DeploymentFixture
@@ -836,7 +937,7 @@ def main():
                                          "_startup_reverted", "_startup_newer",
                                          "_startup_version", "_startup_idle_draft",
                                          "_startup_first_push", "_tcp_check", "_tcp_offline",
-                                         "_tcp_health"))
+                                         "_tcp_health", "_single_check", "_single_apply"))
     parser.add_argument("node", nargs="?", choices=("proxy-a", "proxy-b"))
     args = parser.parse_args()
     if args.action.startswith("_"):
@@ -852,6 +953,7 @@ def main():
         lab.show()
     elif args.action == "test":
         try:
+            lab.test_single_node_deployment()
             lab.test_tcp_deployment()
             lab.test_startup()
             lab.up()
@@ -864,12 +966,12 @@ def main():
             lab.compose("start", active)
             lab.phase("_recover")
             lab.phase("_local_ui")
-            print("PASS: real dual-node integration tests completed.", flush=True)
+            print("PASS: real single-node and dual-node integration tests completed.", flush=True)
         except (LabError, subprocess.CalledProcessError):
-            lab.compose("logs", "--tail", "80")
+            lab.compose("--profile", "single", "logs", "--tail", "80")
             raise
         finally:
-            lab.compose("down", "--volumes")
+            lab.compose("--profile", "single", "down", "--volumes")
     elif args.action == "check":
         lab.phase("_check")
     elif args.action == "down":
